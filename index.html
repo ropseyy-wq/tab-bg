@@ -2093,8 +2093,13 @@ window.wallpaperPropertyListener = {
       "topleft":      { x: 20, y: 20 },
       "topright":     { x: 80, y: 20 },
       "bottomleft":   { x: 20, y: 80 },
-      "bottomright":  { x: 80, y: 80 }
+      "bottomright":  { x: 80, y: 80 },
+      "up":           { x: 50, y: 20 },
+      "down":         { x: 50, y: 80 },
+      "up-left":      { x: 20, y: 20 },
+      "up-right":     { x: 80, y: 20 }
     }[pos];
+    if (!preset && !pos) { props.clockx = 50; props.clocky = 50; }
     if (preset) {
       props.clockx = preset.x;
       props.clocky = preset.y;
