@@ -1,0 +1,2076 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>Real-Time Solar Seasons</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #000; overflow: hidden;
+  }
+  .layer {
+    position: absolute; top: 0; left: 0;
+    width: 100%; height: 100%;
+    object-fit: cover;
+    opacity: 0;
+    transition: opacity 2.5s linear;
+  }
+  .layer.active { opacity: 1; }
+  /* First paint must not depend on a transition firing. */
+  .layer.instant { transition: none !important; }
+
+  /* ---- clock overlay -------------------------------------------------
+     Segoe UI Variable Display is Windows 11's display face and the best
+     looking thing guaranteed to be on the machine - no webfont, since the
+     wallpaper has to render with no network. Tabular figures matter more
+     than the face does: with proportional digits a "1" is narrower than a
+     "0", so the whole line twitches sideways every single second. */
+  #clock {
+    position: absolute;
+    /* Horizontally centred, sitting a little above the vertical middle.
+       Dead centre lands the clock on whatever the scene's focal point is -
+       in this world, straight onto a tree trunk. These are only the values
+       used before the user's own settings arrive; the sliders own it after
+       that. */
+    left: 50%; top: 42%;
+    transform: translate(-50%, -50%);
+    z-index: 2;
+    text-align: center;
+    color: #fff;
+    font-family: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+    /* Two shadows: a wide soft one to lift the text off bright sky, and a
+       tight dark one to keep edges crisp against pale clouds. */
+    text-shadow: 0 2px 22px rgba(0,0,0,.55), 0 1px 4px rgba(0,0,0,.45);
+    pointer-events: none;
+    user-select: none;
+    transition: opacity .6s ease;
+  }
+  #clock.off { opacity: 0; }
+
+  #clocktime {
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    font-size: clamp(44px, 9.5vh, 168px);
+    font-weight: 200;
+    line-height: 1;
+    letter-spacing: -.01em;
+  }
+
+  /* Each digit is a fixed-size window with the glyphs stacked inside it.
+     On a change the outgoing digit rolls up and out of the top while the
+     incoming one rolls up from the bottom - both visible at once, which is
+     what makes it read as a mechanical counter rather than a crossfade. */
+  .dg {
+    position: relative;
+    display: inline-block;
+    min-width: .58em;
+    height: 1em;
+    overflow: hidden;
+    vertical-align: top;
+  }
+  .dg > span {
+    position: absolute;
+    left: 0; right: 0; top: 0;
+    text-align: center;
+    will-change: transform;
+  }
+  /* Width animates alongside the glyph roll so a digit appearing or leaving
+     pushes its neighbours smoothly rather than snapping them sideways. */
+  .dg.fresh { animation: dgWiden .52s cubic-bezier(.2,.85,.3,1) both; }
+  .dg.gone  { animation: dgNarrow .52s cubic-bezier(.4,0,.2,1) both; }
+  @keyframes dgWiden  { from { min-width: 0; } to { min-width: .58em; } }
+  @keyframes dgNarrow { from { min-width: .58em; } to { min-width: 0; } }
+  #colon {
+    opacity: .55;
+    margin: 0 .02em;
+  }
+  #sec {
+    font-size: .38em;
+    font-weight: 300;
+    opacity: .85;
+    margin: .22em 0 0 .14em;
+    display: flex;
+  }
+  #ampm {
+    font-size: .26em;
+    font-weight: 400;
+    opacity: .7;
+    align-self: flex-end;
+    margin: 0 0 .5em .3em;
+    letter-spacing: .12em;
+  }
+
+  /* Kept brief on purpose. While anything animates the compositor must
+     produce frames at display refresh - 180Hz on the primary monitor -
+     instead of only when a video frame arrives. Only the digits that
+     actually changed ever animate, so a normal second moves one glyph. */
+  .dg > span.in  { animation: rollIn  .5s cubic-bezier(.2,.85,.25,1) both; }
+  .dg > span.out { animation: rollOut .5s cubic-bezier(.2,.85,.25,1) both; }
+  @keyframes rollIn {
+    from { transform: translateY(105%); opacity: 0; }
+    60%  { opacity: 1; }
+    to   { transform: translateY(0);    opacity: 1; }
+  }
+  @keyframes rollOut {
+    from { transform: translateY(0);     opacity: 1; }
+    40%  { opacity: 1; }
+    to   { transform: translateY(-105%); opacity: 0; }
+  }
+
+  /* Minute sweep under the time. */
+  #clockbar {
+    position: relative;   /* containing block for #spark and #trail */
+    width: min(34vw, 380px);
+    height: 3px;
+    margin: 1.5vh auto 1.3vh;
+    /* Kept below the fill's faintest stop (.10) so the sheen's tail still
+       reads as brighter than the groove it sits in rather than dipping
+       darker than it. */
+    background: rgba(255,255,255,.07);
+    border-radius: 3px;
+  }
+  #clockbar i {
+    position: relative;
+    display: block; height: 100%; width: 0;
+    border-radius: 3px;
+    overflow: hidden;
+    background: rgba(255,255,255,.09);
+    /* Linear, and exactly one second long - see the width maths in
+       paintClock. Any easing here would make the bar accelerate and brake
+       once per second, which is the stepping we are trying to remove. */
+    transition: width 1s linear;
+  }
+  /* Water, not a stripe. Two independent wave layers drift across each
+     other at different periods and in opposite directions, so crests meet
+     and part instead of repeating - the eye never catches a cycle even
+     though each layer alone is perfectly periodic.
+     Each layer's alpha follows a cosine, sampled at 41 points per period.
+     A linear-gradient interpolates in straight segments, so the slope changes
+     abruptly at every stop even though the colour does not - and the eye
+     reads that slope corner as a faint line (a Mach band). Density is the
+     only cure: at 13 stops the worst slope break was 0.0456, at 41 it is
+     0.00419, roughly a tenth as sharp and below the threshold where the
+     band is visible. */
+  #clockbar i::after,
+  #clockbar i::before {
+    content: "";
+    position: absolute;
+    top: 0; bottom: 0; left: 0;
+    background-repeat: repeat-x;
+    animation-timing-function: linear;
+    animation-iteration-count: infinite;
+  }
+  #clockbar i::after {
+    width: calc(100% + 180px);
+    background-image: linear-gradient(90deg,
+                rgba(255,255,255,0.6400) 0.000%,
+                rgba(255,255,255,0.6379) 2.500%,
+                rgba(255,255,255,0.6317) 5.000%,
+                rgba(255,255,255,0.6215) 7.500%,
+                rgba(255,255,255,0.6075) 10.000%,
+                rgba(255,255,255,0.5902) 12.500%,
+                rgba(255,255,255,0.5699) 15.000%,
+                rgba(255,255,255,0.5472) 17.500%,
+                rgba(255,255,255,0.5225) 20.000%,
+                rgba(255,255,255,0.4966) 22.500%,
+                rgba(255,255,255,0.4700) 25.000%,
+                rgba(255,255,255,0.4434) 27.500%,
+                rgba(255,255,255,0.4175) 30.000%,
+                rgba(255,255,255,0.3928) 32.500%,
+                rgba(255,255,255,0.3701) 35.000%,
+                rgba(255,255,255,0.3498) 37.500%,
+                rgba(255,255,255,0.3325) 40.000%,
+                rgba(255,255,255,0.3185) 42.500%,
+                rgba(255,255,255,0.3083) 45.000%,
+                rgba(255,255,255,0.3021) 47.500%,
+                rgba(255,255,255,0.3000) 50.000%,
+                rgba(255,255,255,0.3021) 52.500%,
+                rgba(255,255,255,0.3083) 55.000%,
+                rgba(255,255,255,0.3185) 57.500%,
+                rgba(255,255,255,0.3325) 60.000%,
+                rgba(255,255,255,0.3498) 62.500%,
+                rgba(255,255,255,0.3701) 65.000%,
+                rgba(255,255,255,0.3928) 67.500%,
+                rgba(255,255,255,0.4175) 70.000%,
+                rgba(255,255,255,0.4434) 72.500%,
+                rgba(255,255,255,0.4700) 75.000%,
+                rgba(255,255,255,0.4966) 77.500%,
+                rgba(255,255,255,0.5225) 80.000%,
+                rgba(255,255,255,0.5472) 82.500%,
+                rgba(255,255,255,0.5699) 85.000%,
+                rgba(255,255,255,0.5902) 87.500%,
+                rgba(255,255,255,0.6075) 90.000%,
+                rgba(255,255,255,0.6215) 92.500%,
+                rgba(255,255,255,0.6317) 95.000%,
+                rgba(255,255,255,0.6379) 97.500%,
+                rgba(255,255,255,0.6400) 100.000%);
+    background-size: 90px 100%;
+    animation-name: waveA;
+    animation-duration: 2.4s;
+  }
+  #clockbar i::before {
+    width: calc(100% + 274px);
+    background-image: linear-gradient(90deg,
+                rgba(255,255,255,0.3200) 0.000%,
+                rgba(255,255,255,0.3186) 2.500%,
+                rgba(255,255,255,0.3146) 5.000%,
+                rgba(255,255,255,0.3080) 7.500%,
+                rgba(255,255,255,0.2990) 10.000%,
+                rgba(255,255,255,0.2878) 12.500%,
+                rgba(255,255,255,0.2747) 15.000%,
+                rgba(255,255,255,0.2599) 17.500%,
+                rgba(255,255,255,0.2440) 20.000%,
+                rgba(255,255,255,0.2272) 22.500%,
+                rgba(255,255,255,0.2100) 25.000%,
+                rgba(255,255,255,0.1928) 27.500%,
+                rgba(255,255,255,0.1760) 30.000%,
+                rgba(255,255,255,0.1601) 32.500%,
+                rgba(255,255,255,0.1453) 35.000%,
+                rgba(255,255,255,0.1322) 37.500%,
+                rgba(255,255,255,0.1210) 40.000%,
+                rgba(255,255,255,0.1120) 42.500%,
+                rgba(255,255,255,0.1054) 45.000%,
+                rgba(255,255,255,0.1014) 47.500%,
+                rgba(255,255,255,0.1000) 50.000%,
+                rgba(255,255,255,0.1014) 52.500%,
+                rgba(255,255,255,0.1054) 55.000%,
+                rgba(255,255,255,0.1120) 57.500%,
+                rgba(255,255,255,0.1210) 60.000%,
+                rgba(255,255,255,0.1322) 62.500%,
+                rgba(255,255,255,0.1453) 65.000%,
+                rgba(255,255,255,0.1601) 67.500%,
+                rgba(255,255,255,0.1760) 70.000%,
+                rgba(255,255,255,0.1928) 72.500%,
+                rgba(255,255,255,0.2100) 75.000%,
+                rgba(255,255,255,0.2272) 77.500%,
+                rgba(255,255,255,0.2440) 80.000%,
+                rgba(255,255,255,0.2599) 82.500%,
+                rgba(255,255,255,0.2747) 85.000%,
+                rgba(255,255,255,0.2878) 87.500%,
+                rgba(255,255,255,0.2990) 90.000%,
+                rgba(255,255,255,0.3080) 92.500%,
+                rgba(255,255,255,0.3146) 95.000%,
+                rgba(255,255,255,0.3186) 97.500%,
+                rgba(255,255,255,0.3200) 100.000%);
+    background-size: 137px 100%;
+    animation-name: waveB;
+    animation-duration: 3.9s;
+  }
+  /* Each layer is oversized by two of its own periods and slid exactly one,
+     so both loop without a seam. Opposite signs cross the two flows. */
+  @keyframes waveA {
+    from { transform: translateX(0); }
+    to   { transform: translateX(-90px); }
+  }
+  @keyframes waveB {
+    from { transform: translateX(-137px); }
+    to   { transform: translateX(0); }
+  }
+
+  /* Keeps the soft tail and the feathered leading edge from before, so the
+     bar still has no hard "level" marker under the colour. */
+  /* The mask was the source of the faint vertical lines. With only five
+     stops it had hard slope changes at 28%, 72% and 92% - and unlike the
+     wave gradients, which slide, these sat at fixed positions along the bar,
+     so they read as stationary marks rather than moving texture.
+     Both the lead-in and the tail now follow a smoothstep, whose slope is
+     zero at each end, so they meet the flat middle with no corner at all. */
+  #clockbar i {
+    -webkit-mask-image: linear-gradient(90deg,
+                rgba(0,0,0,0.4500) 0.00%,
+                rgba(0,0,0,0.4608) 2.50%,
+                rgba(0,0,0,0.4907) 5.00%,
+                rgba(0,0,0,0.5359) 7.50%,
+                rgba(0,0,0,0.5926) 10.00%,
+                rgba(0,0,0,0.6569) 12.50%,
+                rgba(0,0,0,0.7250) 15.00%,
+                rgba(0,0,0,0.7931) 17.50%,
+                rgba(0,0,0,0.8574) 20.00%,
+                rgba(0,0,0,0.9141) 22.50%,
+                rgba(0,0,0,0.9593) 25.00%,
+                rgba(0,0,0,0.9892) 27.50%,
+                rgba(0,0,0,1.0000) 30.00%,
+                rgba(0,0,0,0.9949) 63.58%,
+                rgba(0,0,0,0.9803) 65.17%,
+                rgba(0,0,0,0.9570) 66.75%,
+                rgba(0,0,0,0.9259) 68.33%,
+                rgba(0,0,0,0.8879) 69.92%,
+                rgba(0,0,0,0.8438) 71.50%,
+                rgba(0,0,0,0.7944) 73.08%,
+                rgba(0,0,0,0.7407) 74.67%,
+                rgba(0,0,0,0.6836) 76.25%,
+                rgba(0,0,0,0.6238) 77.83%,
+                rgba(0,0,0,0.5624) 79.42%,
+                rgba(0,0,0,0.5000) 81.00%,
+                rgba(0,0,0,0.4376) 82.58%,
+                rgba(0,0,0,0.3762) 84.17%,
+                rgba(0,0,0,0.3164) 85.75%,
+                rgba(0,0,0,0.2593) 87.33%,
+                rgba(0,0,0,0.2056) 88.92%,
+                rgba(0,0,0,0.1562) 90.50%,
+                rgba(0,0,0,0.1121) 92.08%,
+                rgba(0,0,0,0.0741) 93.67%,
+                rgba(0,0,0,0.0430) 95.25%,
+                rgba(0,0,0,0.0197) 96.83%,
+                rgba(0,0,0,0.0051) 98.42%,
+                rgba(0,0,0,0.0000) 100.00%);
+            mask-image: linear-gradient(90deg,
+                rgba(0,0,0,0.4500) 0.00%,
+                rgba(0,0,0,0.4608) 2.50%,
+                rgba(0,0,0,0.4907) 5.00%,
+                rgba(0,0,0,0.5359) 7.50%,
+                rgba(0,0,0,0.5926) 10.00%,
+                rgba(0,0,0,0.6569) 12.50%,
+                rgba(0,0,0,0.7250) 15.00%,
+                rgba(0,0,0,0.7931) 17.50%,
+                rgba(0,0,0,0.8574) 20.00%,
+                rgba(0,0,0,0.9141) 22.50%,
+                rgba(0,0,0,0.9593) 25.00%,
+                rgba(0,0,0,0.9892) 27.50%,
+                rgba(0,0,0,1.0000) 30.00%,
+                rgba(0,0,0,0.9949) 63.58%,
+                rgba(0,0,0,0.9803) 65.17%,
+                rgba(0,0,0,0.9570) 66.75%,
+                rgba(0,0,0,0.9259) 68.33%,
+                rgba(0,0,0,0.8879) 69.92%,
+                rgba(0,0,0,0.8438) 71.50%,
+                rgba(0,0,0,0.7944) 73.08%,
+                rgba(0,0,0,0.7407) 74.67%,
+                rgba(0,0,0,0.6836) 76.25%,
+                rgba(0,0,0,0.6238) 77.83%,
+                rgba(0,0,0,0.5624) 79.42%,
+                rgba(0,0,0,0.5000) 81.00%,
+                rgba(0,0,0,0.4376) 82.58%,
+                rgba(0,0,0,0.3762) 84.17%,
+                rgba(0,0,0,0.3164) 85.75%,
+                rgba(0,0,0,0.2593) 87.33%,
+                rgba(0,0,0,0.2056) 88.92%,
+                rgba(0,0,0,0.1562) 90.50%,
+                rgba(0,0,0,0.1121) 92.08%,
+                rgba(0,0,0,0.0741) 93.67%,
+                rgba(0,0,0,0.0430) 95.25%,
+                rgba(0,0,0,0.0197) 96.83%,
+                rgba(0,0,0,0.0051) 98.42%,
+                rgba(0,0,0,0.0000) 100.00%);
+  }
+
+  /* Spray at the crest, and spindrift when it pulls back.
+     Both layers sit outside the fill: the fill has overflow:hidden to keep
+     the waves inside it, so anything drawn within it could never escape its
+     edge. These are siblings, free to drift past the bar. */
+  #spark, #trail {
+    position: absolute;
+    pointer-events: none;
+  }
+  #spark {
+    top: 50%;
+    left: 0;
+    /* Rides the leading edge - JS gives it the same percentage and the same
+       one-second linear glide as the fill, so it never lags the crest. */
+    transition: left 1s linear;
+  }
+  #clockbar.rewind #spark { transition: left 1.25s cubic-bezier(.2,.6,.1,1); }
+  #spark b, #trail b, #wake b {
+    position: absolute;
+    width: 2px; height: 2px;
+    margin: -1px 0 0 -1px;
+    border-radius: 50%;
+    background: #fff;
+    opacity: 0;
+  }
+  #spark b {
+    animation-name: spray;
+    animation-duration: var(--d);
+    animation-delay: var(--t);
+    animation-timing-function: cubic-bezier(.25,.6,.4,1);
+    animation-iteration-count: infinite;
+  }
+  @keyframes spray {
+    0%   { opacity: 0;   transform: translate(0,0) scale(.4); }
+    18%  { opacity: .95; }
+    100% { opacity: 0;   transform: translate(var(--dx), var(--dy)) scale(.15); }
+  }
+
+  #trail, #wake { inset: 0; }
+  /* Spent seconds. One dot is released at the crest on every tick and left
+     behind in the bar's own coordinates - it does not ride the crest, so the
+     bar visibly pulls away from it. Sized per-dot, and animated through the
+     Web Animations API rather than CSS: each release needs its own random
+     drift, and WAAPI restarts cleanly every time without the changed-
+     animation-name dance a CSS class would need. */
+  #wake b { width: var(--s); height: var(--s); }
+  #trail b { top: 50%; left: var(--x); }
+  /* Only runs while the bar is retreating. Removing the class ends it, and
+     re-adding next minute restarts it cleanly - animation-name goes
+     none -> shed -> none, and a changed name is what forces a restart. */
+  #clockbar.shedding #trail b {
+    animation-name: shed;
+    animation-duration: .8s;
+    animation-delay: var(--t);
+    animation-timing-function: cubic-bezier(.2,.7,.3,1);
+    animation-fill-mode: both;
+  }
+  @keyframes shed {
+    0%   { opacity: 0;   transform: translate(0,0) scale(.3); }
+    20%  { opacity: .9;  transform: translate(-1px, calc(var(--dy) * .3)) scale(1); }
+    100% { opacity: 0;   transform: translate(var(--dx), var(--dy)) scale(.2); }
+  }
+
+  /* Draining, not sweeping. An ease-in-out starts slowly, which reads as
+     something pushing the bar back. Water does the opposite: it goes as soon
+     as the plug is pulled, then takes forever over the last stretch as the
+     head of water falls away and the flow dies.
+     This curve is 28% drained by 100ms - a real release, not a crawl - and
+     spends 57% of its run on the final tenth. (easeOutExpo would be 42% by
+     100ms, which reads as a snap rather than a drain.)
+     1.25s outlasts a tick, so paintClock skips its width update while this
+     is running rather than fighting it. */
+  #clockbar.rewind i { transition: width 1.25s cubic-bezier(.2,.6,.1,1); }
+  /* Recovering from the drain. The drain outlasts a tick, so the bar comes
+     out of it behind, and that lost ground has to be made up somewhere.
+     Doing it inside one second meant a ten-times surge that stopped dead at
+     the normal rate - the "cannot keep up" gear change. Spread over two
+     seconds it peaks at about three times instead.
+     The curve also ends at exactly the normal rate: its final slope is
+     (1-.8)/(1-.6) = 0.5, and the bar covers 4 units in 2s, so 0.5 x 2 = 1
+     unit per second - precisely the speed of the tick that follows. No step
+     in velocity, so there is nothing to notice at the handoff. */
+  #clockbar.catchup i,
+  #clockbar.catchup #spark {
+    transition-duration: 2s;
+    transition-timing-function: cubic-bezier(.3,.5,.6,.8);
+  }
+
+  /* One-time entrance so it arrives rather than just appearing. */
+  #clock.intro { animation: clockIn 1.1s cubic-bezier(.16,.9,.24,1); }
+  @keyframes clockIn {
+    from { opacity: 0; transform: translate(-50%,-46%); filter: blur(6px); }
+    to   { opacity: 1; transform: translate(-50%,-50%); filter: blur(0); }
+  }
+
+  /* The date rolls the same way the digits do, but its glyphs are
+     proportional - a "W" is not a "1" - so the INCOMING character stays in
+     normal flow and defines the box width, while only the outgoing one is
+     taken out of flow. Fixed-width boxes here would space it like a ransom
+     note. */
+  #clockdate .ch,
+  #ampm .ch {
+    position: relative;
+    display: inline-block;
+    /* Taller than the glyphs so descenders - the comma, and lowercase g/y/p
+       in other date formats - are not sheared off by the overflow clip. The
+       negative margin pulls the extra height back out of the line box so the
+       date sits exactly where it did before. */
+    height: 1.34em;
+    margin-bottom: -.34em;
+    overflow: hidden;
+    vertical-align: top;
+    white-space: pre;
+  }
+  /* Spans match the box height so translateY(-105%) clears it completely;
+     line-height keeps the glyph itself at the top with room underneath. */
+  #clockdate .ch > span,
+  #ampm .ch > span {
+    height: 1.34em;
+    line-height: 1em;
+  }
+  #clockdate .ch > span.in,
+  #ampm .ch > span.in  { display: inline-block; animation: rollIn  .55s cubic-bezier(.2,.85,.25,1) both; }
+  #clockdate .ch > span.out,
+  #ampm .ch > span.out { position: absolute; left: 0; top: 0; animation: rollOut .55s cubic-bezier(.2,.85,.25,1) both; }
+
+  #clockdate {
+    font-size: clamp(12px, 2.05vh, 30px);
+    font-weight: 400;
+    letter-spacing: .2em;
+    text-transform: uppercase;
+    opacity: .82;
+  }
+
+  #debug {
+    position: absolute; top: 16px; left: 16px;
+    font: 13px/1.55 Consolas, monospace;
+    color: #fff; background: rgba(0,0,0,.55);
+    padding: 10px 14px; border-radius: 6px;
+    white-space: pre; pointer-events: none;
+    display: none; max-width: 90vw;
+  }
+  #debug.on  { display: block; }
+  /* Errors surface even with the debug overlay switched off, otherwise
+     a failure inside Wallpaper Engine is just a black screen. */
+  #debug.err { display: block; color: #ffb3b3; background: rgba(60,0,0,.8); }
+
+  /* ---------- New Year ---------- */
+  /* Everything here is inert for all but about forty seconds a year. The
+     overlay carries display:none until the sequence arms, so none of it
+     costs a frame the rest of the time. */
+  #ny {
+    position: fixed;
+    inset: 0;
+    z-index: 5;
+    pointer-events: none;
+    display: none;
+  }
+  #ny.on { display: block; }
+
+  /* Pulls the scene back so the countdown reads against it. Blur and
+     darkness both ramp over the final ten seconds and are released together
+     when the disc opens out. backdrop-filter is expensive, but this exists
+     for about half a minute a year. */
+  #nyveil {
+    position: absolute;
+    inset: 0;
+    background: rgba(0,0,0,0);
+    -webkit-backdrop-filter: blur(0px);
+            backdrop-filter: blur(0px);
+    transition: background-color 1s linear,
+                backdrop-filter 1s linear,
+                -webkit-backdrop-filter 1s linear;
+  }
+  /* The release is quicker than the build, and eased, so the scene snaps
+     back as the disc sweeps outward rather than dissolving slowly. */
+  #ny.reveal #nyveil {
+    background: rgba(0,0,0,0) !important;
+    -webkit-backdrop-filter: blur(0px) !important;
+            backdrop-filter: blur(0px) !important;
+    transition: background-color .85s cubic-bezier(.2,.7,.3,1),
+                backdrop-filter .85s cubic-bezier(.2,.7,.3,1),
+                -webkit-backdrop-filter .85s cubic-bezier(.2,.7,.3,1);
+  }
+
+  #nyfx { position: absolute; inset: 0; width: 100%; height: 100%; }
+
+  /* Every child occupies the same grid cell and is centred by the grid, not
+     by a transform. That matters: the countdown animates transform, and a
+     keyframe setting `transform: scale(...)` would wipe out a centring
+     translate and drop the glyph by half its own height. Centring by layout
+     leaves transform free for animation. */
+  #nystage {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+  }
+  #nystage > * { grid-area: 1 / 1; }
+
+  #nycount {
+    font-family: "Bahnschrift", "DIN Alternate", "Segoe UI", system-ui, sans-serif;
+    font-size: clamp(90px, 24vh, 300px);
+    font-weight: 200;
+    letter-spacing: -.02em;
+    line-height: 1;
+    text-align: center;
+    color: #fff;
+    text-shadow: 0 0 40px rgba(255,255,255,.45), 0 0 120px rgba(120,190,255,.3);
+  }
+
+  /* Sits around the number for the whole countdown. */
+  #nydisc {
+    width: 42vh; height: 42vh;
+    border-radius: 50%;
+    border: 2px solid rgba(255,255,255,.42);
+    box-shadow: 0 0 60px rgba(120,190,255,.18) inset,
+                0 0 40px rgba(255,255,255,.12);
+    opacity: 0;
+  }
+  /* A second ring, thrown off on each count. */
+  #nyring {
+    width: 42vh; height: 42vh;
+    border-radius: 50%;
+    border: 2px solid rgba(255,255,255,.75);
+    opacity: 0;
+  }
+
+  #nybanner {
+    position: absolute;
+    left: 0; right: 0;
+    top: 50%;
+    text-align: center;
+    opacity: 0;
+    /* Centred with a margin rather than translateY so its own scale
+       keyframes cannot fight the centring, same reasoning as the stage. */
+    margin-top: -.5em;
+    font-size: clamp(60px, 17vh, 230px);
+  }
+  #nytitle, #nyyear {
+    font-family: "Bahnschrift", "DIN Alternate", "Segoe UI", system-ui, sans-serif;
+    /* The gradient is painted into the glyphs and then slid, so the colour
+       travels through the letters rather than the letters changing colour. */
+    background-image: linear-gradient(100deg,
+                #ffd977, #ff8fc7, #b39dff, #7fe6ff, #9dffc8, #ffd977);
+    background-size: 260% 100%;
+    -webkit-background-clip: text;
+            background-clip: text;
+    color: transparent;
+    animation: nyHue 5.5s linear infinite;
+  }
+  #nytitle {
+    font-size: .5em;
+    font-weight: 700;
+    letter-spacing: .04em;
+    white-space: nowrap;
+  }
+  #nyyear {
+    font-size: 1em;
+    font-weight: 200;
+    letter-spacing: .06em;
+    line-height: 1.05;
+    margin-top: .06em;
+  }
+  @keyframes nyHue {
+    from { background-position:    0% 50%; }
+    to   { background-position: -260% 50%; }
+  }
+  #nytitle span, #nyyear span {
+    display: inline-block;
+    white-space: pre;
+  }
+
+  /* The clock leans into the moment too, but only on the screen actually
+     running the countdown. */
+  #clock {
+    transition: transform 1s cubic-bezier(.3,.7,.3,1), filter 1s linear;
+  }
+  body.nybuild #clock {
+    /* The translate has to be repeated here. transform is a single property,
+       so a bare scale() would replace the centring rather than add to it, and
+       the clock would jump half its own width and height the moment the
+       countdown armed. */
+    transform: translate(-50%, -50%) scale(calc(1 + var(--ny, 0) * .07));
+    filter: drop-shadow(0 0 calc(var(--ny, 0) * 26px) rgba(160,210,255,.55));
+  }
+</style>
+
+<video id="vidA" class="layer" muted loop playsinline></video>
+<video id="vidB" class="layer" muted loop playsinline></video>
+
+<div id="clock">
+  <div id="clocktime"><span id="hh"></span><span id="colon">:</span><span id="mm"></span><span id="sec"></span><span id="ampm"></span></div>
+  <div id="clockbar"><i></i><span id="spark"></span><span id="wake"></span><span id="trail"></span></div>
+  <div id="clockdate"></div>
+</div>
+
+<div id="ny">
+  <div id="nyveil"></div>
+  <canvas id="nyfx"></canvas>
+  <div id="nystage">
+    <div id="nydisc"></div>
+    <div id="nyring"></div>
+    <div id="nycount"></div>
+  </div>
+  <div id="nybanner">
+    <div id="nytitle"></div>
+    <div id="nyyear"></div>
+  </div>
+</div>
+
+<div id="debug"></div>
+
+<script>
+"use strict";
+
+/* ------------------------------------------------------------------
+   Clip table. Minecraft ticks: 0 = sunrise, 6000 = solar noon,
+   12000 = sunset, 18000 = solar midnight. Every clip is tagged with
+   the tick it was captured at, so real solar position maps straight
+   onto the footage.
+------------------------------------------------------------------ */
+const CLIPS = [
+  { tick:   440, file: "01_dawn_t00440.mp4"      },
+  { tick:  1920, file: "02_morning_t01920.mp4"   },
+  { tick:  3820, file: "03_latemorning_t03820.mp4" },
+  { tick:  6000, file: "04_noon_t06000.mp4"      },
+  { tick:  9000, file: "05_afternoon_t09000.mp4" },
+  { tick: 12000, file: "06_sunset_t12000.mp4"    },
+  { tick: 13840, file: "07_night_t13840.mp4"     },
+  { tick: 16360, file: "08_latenight_t16360.mp4" },
+  { tick: 22400, file: "09_predawn_t22400.mp4"   },
+  { tick: 23220, file: "10_firstlight_t23220.mp4"}
+];
+
+/* Recorded transitions. Each one plays ONCE at natural speed and is
+   timed to finish exactly as the real phase boundary arrives - so the
+   dusk clip starts ~2.5 min before true night and lands on the night
+   loop at the right instant.
+
+   'end' is the tick the footage lands on (always matches a loop clip).
+   'dur' is the encoded length in seconds.
+
+   Note this is deliberately not literal real-time: Minecraft's day is
+   72x faster than a real one, so the sun visibly races. That is the
+   intended look - a timelapse moment punctuating a real-time day. */
+/* Every loop has a transition leading into it, and every transition
+   BEGINS on the exact tick of the loop before it - so there is no light
+   jump anywhere in the cycle. The two long captures were split at the
+   loop boundaries to achieve that.
+
+      start tick        transition          lands on
+        23220   ->  t_to_dawn         ->      440
+          440   ->  t_to_morning      ->     1920
+         1920   ->  t_to_latemorning  ->     3820
+         3820   ->  t_to_noon         ->     6000
+         6000   ->  t_to_afternoon    ->     9000
+         9000   ->  t_to_sunset       ->    12000
+        12000   ->  t_to_night        ->    13840
+        13840   ->  t_to_latenight    ->    16360
+        16360   ->  t_to_predawn      ->    22400
+        22400   ->  t_to_firstlight   ->    23220
+*/
+const TRANSITIONS = [
+  { end:   440, dur:  50, file: "t_to_dawn.mp4"        },
+  { end:  1920, dur:  68, file: "t_to_morning.mp4"     },
+  { end:  3820, dur:  81, file: "t_to_latemorning.mp4" },
+  { end:  6000, dur: 108, file: "t_to_noon.mp4"        },
+  { end:  9000, dur: 150, file: "t_to_afternoon.mp4"   },
+  { end: 12000, dur: 145, file: "t_to_sunset.mp4"      },
+  { end: 13840, dur:  84, file: "t_to_night.mp4"       },
+  { end: 16360, dur: 119, file: "t_to_latenight.mp4"   },
+  { end: 22400, dur: 295, file: "t_to_predawn.mp4"     },
+  { end: 23220, dur:  37, file: "t_to_firstlight.mp4"  }
+];
+
+/* Crossfade length between clips, in seconds. Fixed rather than exposed as a
+   setting: it is a look-and-feel detail with one right answer.
+
+   Transitions used to get 1.8x this, on the reasoning that they cut in showing
+   slightly earlier light than reality and a slow fade reads as the light
+   settling rather than as a jump backwards. They now use the same 2.5s as an
+   ordinary loop swap - the entry step is small enough with floor selection and
+   measured end-anchors that the longer blend was costing more in sluggishness
+   than it was buying in smoothness. */
+const FADE_SECONDS = 2.5;
+
+/* Seasons that actually have footage. Anything missing falls back to
+   summer, so the wallpaper still works while the rest are shot. */
+const AVAILABLE = ["summer"];
+const FALLBACK  = "summer";
+
+/* A machine's UTC offset gives a decent longitude estimate (15 deg per
+   hour). Latitude cannot be derived this way, so the user sets that. */
+function longitudeFromTimezone() {
+  const deg = -(new Date().getTimezoneOffset() / 60) * 15;
+  return Math.max(-180, Math.min(180, deg));
+}
+
+/* Longitude falls straight out of the UTC offset, but latitude does not -
+   and latitude is what sets day length. Left to a fixed default, every
+   subscriber would be on New York's latitude: a Norwegian summer day would
+   come out four hours short, and anyone south of the equator would be in
+   the wrong hemisphere until they typed a negative number.
+   The time zone name carries the missing information. Intl reports a region
+   like "Europe/Oslo" rather than just an offset, so a lookup gets most
+   users close with no network access and nothing to configure. Anyone it
+   misses can still type an exact value. */
+const ZONE_LAT = {
+  "Europe/London": 51.5, "Europe/Dublin": 53.3, "Europe/Lisbon": 38.7,
+  "Europe/Madrid": 40.4, "Europe/Paris": 48.9, "Europe/Brussels": 50.8,
+  "Europe/Amsterdam": 52.4, "Europe/Berlin": 52.5, "Europe/Copenhagen": 55.7,
+  "Europe/Oslo": 59.9, "Europe/Stockholm": 59.3, "Europe/Helsinki": 60.2,
+  "Europe/Warsaw": 52.2, "Europe/Prague": 50.1, "Europe/Vienna": 48.2,
+  "Europe/Budapest": 47.5, "Europe/Zurich": 47.4, "Europe/Rome": 41.9,
+  "Europe/Athens": 38.0, "Europe/Bucharest": 44.4, "Europe/Sofia": 42.7,
+  "Europe/Belgrade": 44.8, "Europe/Zagreb": 45.8, "Europe/Kyiv": 50.5,
+  "Europe/Kiev": 50.5, "Europe/Moscow": 55.8, "Europe/Istanbul": 41.0,
+  "Europe/Riga": 56.9, "Europe/Vilnius": 54.7, "Europe/Tallinn": 59.4,
+  "Europe/Minsk": 53.9, "Europe/Bratislava": 48.1, "Europe/Ljubljana": 46.1,
+  "Europe/Sarajevo": 43.9, "Europe/Skopje": 42.0, "Europe/Tirane": 41.3,
+  "Europe/Chisinau": 47.0, "Europe/Malta": 35.9, "Europe/Reykjavik": 64.1,
+  "Europe/Luxembourg": 49.6, "Europe/Andorra": 42.5, "Atlantic/Canary": 28.1,
+
+  "America/New_York": 40.7, "America/Toronto": 43.7, "America/Detroit": 42.3,
+  "America/Chicago": 41.9, "America/Winnipeg": 49.9, "America/Denver": 39.7,
+  "America/Edmonton": 53.5, "America/Phoenix": 33.4, "America/Boise": 43.6,
+  "America/Los_Angeles": 34.1, "America/Vancouver": 49.3,
+  "America/Anchorage": 61.2, "America/Juneau": 58.3, "America/Halifax": 44.6,
+  "America/St_Johns": 47.6, "America/Montreal": 45.5,
+  "America/Mexico_City": 19.4, "America/Monterrey": 25.7,
+  "America/Guatemala": 14.6, "America/Costa_Rica": 9.9, "America/Panama": 9.0,
+  "America/Havana": 23.1, "America/Bogota": 4.7, "America/Caracas": 10.5,
+  "America/Lima": -12.0, "America/La_Paz": -16.5, "America/Santiago": -33.4,
+  "America/Argentina/Buenos_Aires": -34.6, "America/Sao_Paulo": -23.5,
+  "America/Montevideo": -34.9, "America/Asuncion": -25.3,
+  "America/Guayaquil": -2.2, "Pacific/Honolulu": 21.3,
+
+  "Asia/Tokyo": 35.7, "Asia/Seoul": 37.6, "Asia/Shanghai": 31.2,
+  "Asia/Hong_Kong": 22.3, "Asia/Taipei": 25.0, "Asia/Singapore": 1.4,
+  "Asia/Bangkok": 13.8, "Asia/Jakarta": -6.2, "Asia/Manila": 14.6,
+  "Asia/Kuala_Lumpur": 3.1, "Asia/Ho_Chi_Minh": 10.8, "Asia/Saigon": 10.8,
+  "Asia/Kolkata": 22.6, "Asia/Calcutta": 22.6, "Asia/Karachi": 24.9,
+  "Asia/Dhaka": 23.8, "Asia/Kathmandu": 27.7, "Asia/Colombo": 6.9,
+  "Asia/Dubai": 25.2, "Asia/Riyadh": 24.7, "Asia/Tehran": 35.7,
+  "Asia/Baghdad": 33.3, "Asia/Jerusalem": 31.8, "Asia/Amman": 31.9,
+  "Asia/Beirut": 33.9, "Asia/Damascus": 33.5, "Asia/Kuwait": 29.4,
+  "Asia/Qatar": 25.3, "Asia/Muscat": 23.6, "Asia/Tashkent": 41.3,
+  "Asia/Almaty": 43.2, "Asia/Baku": 40.4, "Asia/Tbilisi": 41.7,
+  "Asia/Yerevan": 40.2, "Asia/Kabul": 34.5, "Asia/Ulaanbaatar": 47.9,
+  "Asia/Vladivostok": 43.1, "Asia/Novosibirsk": 55.0,
+  "Asia/Yekaterinburg": 56.8, "Asia/Krasnoyarsk": 56.0,
+
+  "Africa/Cairo": 30.0, "Africa/Lagos": 6.5, "Africa/Nairobi": -1.3,
+  "Africa/Johannesburg": -26.2, "Africa/Casablanca": 33.6,
+  "Africa/Algiers": 36.8, "Africa/Tunis": 36.8, "Africa/Accra": 5.6,
+  "Africa/Addis_Ababa": 9.0, "Africa/Khartoum": 15.6, "Africa/Dakar": 14.7,
+  "Africa/Kinshasa": -4.3, "Africa/Luanda": -8.8, "Africa/Harare": -17.8,
+  "Africa/Maputo": -26.0, "Africa/Tripoli": 32.9, "Africa/Windhoek": -22.6,
+
+  "Australia/Sydney": -33.9, "Australia/Melbourne": -37.8,
+  "Australia/Brisbane": -27.5, "Australia/Perth": -32.0,
+  "Australia/Adelaide": -34.9, "Australia/Darwin": -12.5,
+  "Australia/Hobart": -42.9, "Pacific/Auckland": -36.9,
+  "Pacific/Fiji": -18.1, "Pacific/Guam": 13.4,
+  "Pacific/Port_Moresby": -9.5, "Pacific/Noumea": -22.3
+};
+
+/* When the exact zone is unknown, the continent still narrows it down far
+   better than a single global default would. */
+const REGION_LAT = {
+  Europe: 50, America: 38, Asia: 30, Africa: 5,
+  Australia: -30, Pacific: -20, Atlantic: 40, Indian: -10, Antarctica: -70
+};
+
+function latitudeFromTimezone() {
+  let zone = "";
+  try {
+    zone = Intl.DateTimeFormat().resolvedOptions().timeZone || "";
+  } catch (e) { /* older engines: fall through to the default */ }
+  if (ZONE_LAT[zone] !== undefined) return ZONE_LAT[zone];
+  const region = zone.split("/")[0];
+  if (REGION_LAT[region] !== undefined) return REGION_LAT[region];
+  return 40.8;
+}
+
+const props = {
+  realtime: true,      // false = hold the hour in fixedtime
+  fixedtime: "12",
+  realseason: true,    // false = hold the season in fixedseason
+  fixedseason: "summer",
+  latitude: "40.8",
+  longitude: "-73.2",
+  autolongitude: true,
+  showclock: true,
+  timeformat: "24",     // "12" | "24"
+  dateformat: "wdshort",
+  timescale: 1,
+  clockx: 50,
+  clocky: 42,
+  showdebug: false
+};
+
+/* Both coordinates are typed in, so they arrive as strings and are briefly
+   blank or half-written while being edited ("-", "40."). Anything that will
+   not parse falls back instead of feeding NaN into the solar maths, which
+   would propagate to every clip choice and leave a black screen. */
+function coord(v, fallback, limit) {
+  const n = parseFloat(v);
+  if (!isFinite(n)) return fallback;
+  return Math.max(-limit, Math.min(limit, n));
+}
+
+/* The coordinates actually in force, honouring the auto-detect toggle. */
+const activeLat = () => props.autolongitude
+  ? latitudeFromTimezone()
+  : coord(props.latitude, latitudeFromTimezone(), 90);
+const activeLng = () => props.autolongitude
+  ? longitudeFromTimezone()
+  : coord(props.longitude, longitudeFromTimezone(), 180);
+
+/* ------------------------------------------------------------------
+   Solar position. Standard astronomical formulae - no network needed,
+   the sun is entirely predictable.
+------------------------------------------------------------------ */
+const RAD = Math.PI / 180;
+const DAY_MS = 86400000;
+const J1970 = 2440588;
+const J2000 = 2451545;
+const OBLIQUITY = RAD * 23.4397;
+
+const toJulian   = d => d.valueOf() / DAY_MS - 0.5 + J1970;
+const fromJulian = j => new Date((j + 0.5 - J1970) * DAY_MS);
+const toDays     = d => toJulian(d) - J2000;
+
+function solarMeanAnomaly(d) { return RAD * (357.5291 + 0.98560028 * d); }
+
+function eclipticLongitude(M) {
+  const C = RAD * (1.9148 * Math.sin(M) + 0.02 * Math.sin(2 * M) + 0.0003 * Math.sin(3 * M));
+  return M + C + RAD * 102.9372 + Math.PI;
+}
+
+function declination(L) { return Math.asin(Math.sin(OBLIQUITY) * Math.sin(L)); }
+
+/* Returns { sunrise, sunset, noon } as Dates, or a polar flag when the
+   sun never crosses the horizon that day. */
+function solarTimes(date, lat, lng) {
+  const lw  = RAD * -lng;
+  const phi = RAD * lat;
+  const d   = toDays(date);
+
+  const n   = Math.round(d - 0.0009 - lw / (2 * Math.PI));
+  const ds  = 0.0009 + lw / (2 * Math.PI) + n;
+  const M   = solarMeanAnomaly(ds);
+  const L   = eclipticLongitude(M);
+  const dec = declination(L);
+
+  const Jnoon = J2000 + ds + 0.0053 * Math.sin(M) - 0.0069 * Math.sin(2 * L);
+
+  // -0.833 deg accounts for refraction and the sun's apparent radius
+  const cosW = (Math.sin(-0.833 * RAD) - Math.sin(phi) * Math.sin(dec)) /
+               (Math.cos(phi) * Math.cos(dec));
+
+  if (cosW < -1) return { polar: "day",   noon: fromJulian(Jnoon) };
+  if (cosW >  1) return { polar: "night", noon: fromJulian(Jnoon) };
+
+  const w    = Math.acos(cosW);
+  const a    = 0.0009 + (w + lw) / (2 * Math.PI) + n;
+  const Jset = J2000 + a + 0.0053 * Math.sin(M) - 0.0069 * Math.sin(2 * L);
+
+  return {
+    polar: null,
+    noon:    fromJulian(Jnoon),
+    sunset:  fromJulian(Jset),
+    sunrise: fromJulian(Jnoon - (Jset - Jnoon))
+  };
+}
+
+/* ------------------------------------------------------------------
+   Map real clock time onto a Minecraft tick.
+
+   Daylight is stretched across ticks 0-12000 and night across
+   12000-24000, proportionally. A 17-hour Nordic summer day and a
+   7-hour December one both fill the same daylight footage - the
+   footage just moves through it at different speeds. That is what
+   makes one clip set work at every latitude.
+------------------------------------------------------------------ */
+function timeToTick(now, lat, lng) {
+  const today = solarTimes(now, lat, lng);
+
+  if (today.polar === "day")   return 6000;   // midnight sun
+  if (today.polar === "night") return 18000;  // polar night
+
+  const t = now.getTime();
+  const rise = today.sunrise.getTime();
+  const set  = today.sunset.getTime();
+
+  if (t >= rise && t < set) {
+    return ((t - rise) / (set - rise)) * 12000;
+  }
+
+  // Night: work out which side of midnight we are on.
+  let start, end;
+  if (t >= set) {
+    const tomorrow = solarTimes(new Date(t + DAY_MS), lat, lng);
+    if (tomorrow.polar) return 18000;
+    start = set;
+    end   = tomorrow.sunrise.getTime();
+  } else {
+    const yesterday = solarTimes(new Date(t - DAY_MS), lat, lng);
+    if (yesterday.polar) return 18000;
+    start = yesterday.sunset.getTime();
+    end   = rise;
+  }
+
+  const f = Math.min(Math.max((t - start) / (end - start), 0), 1);
+  return 12000 + f * 12000;
+}
+
+/* Fixed-time mode: plain hours-to-ticks, noon at 12:00.
+
+   The hour arrives from a combo box, so it is a string. Parsed rather than
+   left to JS coercion: "12" - 6 happens to work, but "" - 6 quietly yields
+   -6 and would park the scene at midnight instead of falling back. */
+function hoursToTick(h) {
+  const n = parseFloat(h);
+  const hours = isFinite(n) ? n : 12;
+  return (((hours - 6) / 24) * 24000 + 24000) % 24000;
+}
+
+/* Inverse of timeToTick: when will the sun next reach this tick?
+   Returns epoch ms, or null during polar day/night. */
+function tickToTime(tick, now, lat, lng) {
+  const t = solarTimes(now, lat, lng);
+  if (t.polar) return null;
+
+  const rise = t.sunrise.getTime();
+  const set  = t.sunset.getTime();
+
+  if (tick < 12000) return rise + (tick / 12000) * (set - rise);
+
+  /* Night ticks belong to a night that spans midnight. Before today's
+     sunrise we are still inside the night that began at YESTERDAY's
+     sunset - measuring from today's sunset would put the answer a full
+     day away and the transition would never fire. */
+  if (now.getTime() < rise) {
+    const y = solarTimes(new Date(now.getTime() - DAY_MS), lat, lng);
+    if (y.polar) return null;
+    const ySet = y.sunset.getTime();
+    return ySet + ((tick - 12000) / 12000) * (rise - ySet);
+  }
+
+  const tm = solarTimes(new Date(now.getTime() + DAY_MS), lat, lng);
+  if (tm.polar) return null;
+  return set + ((tick - 12000) / 12000) * (tm.sunrise.getTime() - set);
+}
+
+/* A transition is active during the window [land - dur, land]. Returns
+   the clip plus how far into it we should already be, so a wallpaper
+   launched mid-transition joins at the right frame instead of restarting. */
+function activeTransition(now, lat, lng) {
+  for (const tr of TRANSITIONS) {
+    const land = tickToTime(tr.end, now, lat, lng);
+    if (land === null) continue;
+
+    const remain = (land - now.getTime()) / 1000;
+    if (remain > 0 && remain <= tr.dur) {
+      return { tr: tr, offset: Math.max(0, tr.dur - remain) };
+    }
+  }
+  return null;
+}
+
+/* Which transition fires next, and how long until it starts. Debug only. */
+function nextTransitionInfo(now, lat, lng) {
+  let best = null, soonest = Infinity;
+  for (const tr of TRANSITIONS) {
+    const land = tickToTime(tr.end, now, lat, lng);
+    if (land === null) continue;
+    const startsIn = (land - now.getTime()) / 1000 - tr.dur;
+    if (startsIn > 0 && startsIn < soonest) { soonest = startsIn; best = tr; }
+  }
+  if (!best) return "none upcoming";
+
+  const h = Math.floor(soonest / 3600);
+  const m = Math.floor((soonest % 3600) / 60);
+  return best.file.replace(/^t_to_|\.mp4$/g, "") +
+         " in " + (h ? h + "h " : "") + m + "m";
+}
+
+/* ------------------------------------------------------------------
+   Season boundaries.
+
+   A plain calendar table now: every season opens on a fixed month/day and the
+   sun decides none of them, so the ecliptic-longitude helper this used to
+   need is gone. (solarMeanAnomaly / eclipticLongitude stay - solarTimes still
+   uses them for sunrise and sunset, which are a separate question.)
+
+   Mud season appears TWICE, which is why this is a table rather than a chain
+   of comparisons: once as the wet collapse of late autumn before the ground
+   freezes, and again as the spring thaw. Every other season runs once.
+
+       Feb  6   mud      thaw, through Apr 15
+       Apr 16   spring
+       Jun  1   summer
+       Sep 24   autumn
+       Nov  3   mud      freeze-up, through Dec 11
+       Dec 12   winter   wraps past New Year, through Feb 5
+
+   Lookup is floor-with-wrap: the latest entry the date has reached, falling
+   back to the final entry when it is earlier than all of them. That is what
+   makes Jan 1 - Feb 5 correctly read as the winter that began in December.
+   Same rule pickClip uses on the tick table.
+
+   Leap years need no special case: Feb 29 is 229, which sits between Feb 6
+   and Apr 16 exactly like any other late-February date. The original version
+   of this had no branch matching Feb 29 at all and showed autumn in midwinter.
+------------------------------------------------------------------ */
+const SEASONS = [
+  { md:  206, name: "mud"    },
+  { md:  416, name: "spring" },
+  { md:  601, name: "summer" },
+  { md:  924, name: "autumn" },
+  { md: 1103, name: "mud"    },
+  { md: 1212, name: "winter" }
+];
+
+/* The same calendar slot half a year away, so every cutoff mirrors below the
+   equator: Jun 1 <-> Dec 1, Sep 24 <-> Mar 24, Dec 12 <-> Jun 12. Mirroring
+   whole months keeps them exact - shifting by 182 or 183 days instead lands a
+   day either side depending on the year. */
+function mirrorMonthDay(date) {
+  return (((date.getMonth() + 6) % 12) + 1) * 100 + date.getDate();
+}
+
+function seasonFor(date, lat) {
+  /* Below the equator the year is half a turn out of phase. Moving the
+     cutoffs rather than renaming the results keeps BOTH mud seasons on the
+     southern hemisphere's own thaw and freeze-up. */
+  const md = lat < 0 ? mirrorMonthDay(date)
+                     : (date.getMonth() + 1) * 100 + date.getDate();
+
+  let name = SEASONS[SEASONS.length - 1].name;   // wraps: December's winter
+  for (const s of SEASONS) if (s.md <= md) name = s.name;
+  return name;
+}
+
+const resolveSeason = s => AVAILABLE.indexOf(s) !== -1 ? s : FALLBACK;
+
+/* Which video codecs this CEF build can actually decode. Determines what
+   we have to encode the clips as.
+
+   Memoised, because the debug overlay redraws once a second and this builds a
+   probe <video> element: left uncached it leaked a fresh media element every
+   tick for as long as the overlay was open, which on top of sped-up playback
+   was enough to freeze the wallpaper outright. The answer is a property of
+   the build and cannot change while running. */
+let codecCache = null;
+function codecReport() {
+  if (codecCache !== null) return codecCache;
+  const probe = document.createElement("video");
+  const tests = [
+    ["av1-8bit",  'video/mp4; codecs="av01.0.05M.08"'],
+    ["av1-10bit", 'video/mp4; codecs="av01.0.05M.10"'],
+    ["vp9",       'video/webm; codecs="vp9"'],
+    ["vp9-10bit", 'video/webm; codecs="vp09.02.10.10"'],
+    ["h264",      'video/mp4; codecs="avc1.640028"'],
+    ["hevc",      'video/mp4; codecs="hvc1.1.6.L93.B0"']
+  ];
+  /* canPlayType answers "probably" / "maybe" / "" - map that to
+     something readable. "maybe" genuinely means uncertain, so it keeps
+     its own label rather than being rounded up to yes. */
+  const say = { "probably": "yes", "maybe": "maybe", "": "no" };
+
+  codecCache = tests
+    .map(t => t[0] + "=" + (say[probe.canPlayType(t[1])] || "no"))
+    .join("  ");
+  return codecCache;
+}
+
+/* Show the most recent phase the sun has actually REACHED - not the
+   nearest one.
+
+   Picking the nearest clip meant a phase arrived early: the night loop
+   took over ~40 min before the dusk transition ran, so the transition
+   was delivering you somewhere you already were. A phase must not
+   appear until the transition leading into it has finished.
+
+   CLIPS is ordered by tick; before the first entry we wrap to the last. */
+function pickClip(tick) {
+  let best = CLIPS[CLIPS.length - 1];
+  for (const c of CLIPS) {
+    if (c.tick <= tick) best = c;
+  }
+  return best;
+}
+
+/* ------------------------------------------------------------------
+   Playback: two stacked <video> layers, crossfaded on opacity.
+------------------------------------------------------------------ */
+const vids = [document.getElementById("vidA"), document.getElementById("vidB")];
+const dbg  = document.getElementById("debug");
+let front = 0;
+let currentSrc = null;
+let swapping = false;
+
+let firstPaint = true;
+let lastError = null;
+let lastSeason = null;
+
+const MEDIA_ERR = {
+  1: "MEDIA_ERR_ABORTED",
+  2: "MEDIA_ERR_NETWORK - file not found or unreadable",
+  3: "MEDIA_ERR_DECODE - file is corrupt",
+  4: "MEDIA_ERR_SRC_NOT_SUPPORTED - codec unsupported (h264 not built into this CEF?)"
+};
+
+function show(src, opts) {
+  if (src === currentSrc || swapping) return;
+  opts = opts || {};
+  swapping = true;
+
+  const incoming = vids[1 - front];
+  const outgoing = vids[front];
+  const instant = firstPaint;
+
+  // Transitions play once and may join part-way through; loops repeat.
+  incoming.loop = opts.loop !== false;
+  incoming.playbackRate = opts.rate || 1;
+
+  // No fade on the very first clip - if the transition never fires we
+  // would otherwise sit at opacity 0 forever, i.e. a black screen.
+  const fade = opts.fade || FADE_SECONDS;
+  incoming.classList.toggle("instant", instant);
+  incoming.style.transitionDuration = fade + "s";
+  outgoing.style.transitionDuration = fade + "s";
+
+  /* A quality change fades all the way out to black and back in, rather
+     than cross-dissolving - the two files are the same footage at a
+     different resolution, so a crossfade would look like nothing
+     happened and the switch would go unnoticed. */
+  const blackout = opts.blackout && !instant;
+
+  let settled = false;
+
+  const beginLoad = () => {
+    incoming.src = src;
+    incoming.load();
+    incoming.addEventListener("canplay", go, { once: true });
+    incoming.addEventListener("error", fail, { once: true });
+    setTimeout(fail, 5000);
+  };
+
+  const go = () => {
+    if (settled) return;
+    settled = true;
+
+    let started = false;
+    const start = () => {
+      if (started) return;
+      started = true;
+
+      incoming.play().catch(e => { lastError = "play() rejected: " + e.message; });
+      incoming.classList.add("active");
+      outgoing.classList.remove("active");
+
+      setTimeout(() => {
+        outgoing.pause();
+        /* Drop the old source so its decoder and buffered frames are
+           freed. Without this both <video> elements hold a live 1440p
+           decode context for the entire session. */
+        outgoing.removeAttribute("src");
+        try { outgoing.load(); } catch (e) { /* empty source, harmless */ }
+
+        if (instant) incoming.classList.remove("instant");
+        swapping = false;
+        firstPaint = false;
+      }, instant ? 50 : fade * 1000 + 100);
+
+      front = 1 - front;
+      currentSrc = src;
+    };
+
+    if (opts.seek) {
+      /* `canplay` only promises a frame at the position the file opened at.
+         Transitions are joined part-way through, so the seek moves to a
+         point that has not been decoded yet - and fading in there shows
+         BLACK until the decoder catches up. Harmless on a short clip, very
+         visible on the long ones where the offset can be minutes deep.
+         Wait for the seek to land, and for a frame to actually exist at the
+         new position, before starting the fade. */
+      const ready = () => {
+        if (incoming.readyState >= 2) start();
+        else incoming.addEventListener("loadeddata", start, { once: true });
+      };
+      incoming.addEventListener("seeked", ready, { once: true });
+      /* Never hang: if `seeked` does not arrive, show it anyway rather than
+         leaving the previous clip frozen on screen forever. */
+      setTimeout(start, 2500);
+      try { incoming.currentTime = Math.min(opts.seek, (incoming.duration || 1e9) - 0.1); }
+      catch (e) { start(); }
+    } else {
+      start();
+    }
+  };
+
+  const fail = () => {
+    if (settled) return;
+    settled = true;
+    swapping = false;
+    const e = incoming.error;
+    lastError = "cannot load " + src + "\n  " +
+      (e ? (MEDIA_ERR[e.code] || ("code " + e.code)) : "no canplay within 5s");
+  };
+
+  if (blackout) {
+    // Fade the current layer down to black, then bring the new one up.
+    outgoing.classList.remove("active");
+    setTimeout(beginLoad, fade * 1000 + 60);
+  } else {
+    beginLoad();
+  }
+}
+
+/* One multiplier for everything: at 4x the clips play four times faster AND
+   the clock runs four times faster, so transitions arrive four times sooner.
+   The whole world speeds up together rather than the footage and the schedule
+   drifting apart.
+
+   Capped at 4. A plain Chromium build sustains 8x on the heaviest autumn clip
+   (t_to_sunset, ~33 Mbps of 1440p60 AV1), two streams at once included, but
+   Wallpaper Engine's CEF has less decode headroom than that and froze solid
+   at 8x - as it had at 16x. The ceiling that matters is the one in WE, which
+   cannot be benchmarked from here, so this sits at half the value that failed
+   rather than at the edge measured somewhere else. */
+const MAX_SPEED = 4;
+const speed = () => Math.min(Math.max(props.timescale, 1), MAX_SPEED);
+
+/* Virtual clock. Rebased on every speed change rather than scaling all the
+   time since boot - otherwise nudging the slider retroactively rescales the
+   whole session and the clock lurches hours sideways mid-view. */
+let virtualBase = Date.now();
+let realBase = Date.now();
+let lastSpeed = 1;
+function virtualNow() {
+  const s = speed(), now = Date.now();
+  if (s !== lastSpeed) {
+    virtualBase += (now - realBase) * lastSpeed;
+    realBase = now;
+    lastSpeed = s;
+  }
+  return new Date(virtualBase + (now - realBase) * s);
+}
+
+/* ------------------------------------------------------------------
+   Clock overlay.
+
+   Always shows real wall time, never virtualNow() - the speed slider is
+   for previewing the sky, and a clock that raced ahead of the actual time
+   would just be telling the user something false.
+
+   Month and day names are spelled out here rather than taken from Intl,
+   so the wallpaper reads the same on every machine instead of quietly
+   switching language with the OS locale.
+------------------------------------------------------------------ */
+const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday",
+                   "Thursday", "Friday", "Saturday"];
+const MONTH_NAMES = ["January", "February", "March", "April", "May", "June",
+                     "July", "August", "September", "October", "November",
+                     "December"];
+
+const clockEl = document.getElementById("clock");
+const hhEl    = document.getElementById("hh");
+const mmEl    = document.getElementById("mm");
+const secEl   = document.getElementById("sec");
+const ampmEl  = document.getElementById("ampm");
+const timeEl  = document.getElementById("clocktime");
+timeEl.style.transform = "";   /* row is centred as a whole again */
+
+/* The hours and minutes are what the eye reads as "the clock", so they are
+   what should sit on the centre line - but the seconds and AM/PM hang off
+   the right, and a centred flex row counts them, pulling the big digits
+   left. The bar and the date underneath have no such tail, so they stay
+   centred and the mismatch is visible as the time looking shifted.
+   Offsetting the row by half the tail's width puts the hours back on centre
+   and lets the small text overhang, which is how a clock is normally set.
+   Measured from the tail itself rather than from the row's own position, so
+   applying the offset cannot feed back into the next measurement. */
+/* isFinite rather than ||, which would treat a legitimate 0 as a missing
+   value and silently substitute the default. */
+function clampPct(v, fallback, halfSpan) {
+  const n = Number(v);
+  const p = isFinite(n) ? n : fallback;
+  const lo = Math.min(halfSpan, 50), hi = Math.max(100 - halfSpan, 50);
+  return Math.min(Math.max(p, lo), hi);
+}
+
+function positionClock() {
+  const r = clockEl.getBoundingClientRect();
+  const halfW = innerWidth  ? (r.width  / 2) / innerWidth  * 100 : 0;
+  const halfH = innerHeight ? (r.height / 2) / innerHeight * 100 : 0;
+  const x = clampPct(props.clockx, 50, halfW) + "%";
+  const y = clampPct(props.clocky, 42, halfH) + "%";
+  if (clockEl.style.left !== x) clockEl.style.left = x;
+  if (clockEl.style.top  !== y) clockEl.style.top  = y;
+}
+
+const dateEl  = document.getElementById("clockdate");
+const barEl   = document.getElementById("clockbar");
+const barFill = barEl.firstElementChild;
+const sparkEl = document.getElementById("spark");
+const trailEl = document.getElementById("trail");
+const wakeEl  = document.getElementById("wake");
+
+/* Dots are built once and then only ever animated, so there is no DOM churn
+   on the tick. Their scatter is randomised at startup rather than hardcoded
+   so the spray does not read as a repeating pattern. */
+(function buildParticles() {
+  const rnd = (lo, hi) => lo + Math.random() * (hi - lo);
+  for (let i = 0; i < 7; i++) {
+    const b = document.createElement("b");
+    b.style.setProperty("--dx", rnd(4, 15).toFixed(1) + "px");
+    b.style.setProperty("--dy", rnd(-7, 7).toFixed(1) + "px");
+    b.style.setProperty("--d",  rnd(1.1, 2.3).toFixed(2) + "s");
+    b.style.setProperty("--t",  rnd(-2.3, 0).toFixed(2) + "s");
+    sparkEl.appendChild(b);
+  }
+  /* Spread along the bar, each dot shedding at the moment the receding edge
+     actually reaches it. The edge does not move linearly - it follows the
+     drain curve - so a linear delay would have the left-hand dots letting go
+     long before the water got to them. Solving the curve puts every dot on
+     the edge instead. */
+  const DRAIN_MS = 1250;
+  const bezY = (x1, y1, x2, y2, x) => {
+    const bx = t => 3*(1-t)*(1-t)*t*x1 + 3*(1-t)*t*t*x2 + t*t*t;
+    const by = t => 3*(1-t)*(1-t)*t*y1 + 3*(1-t)*t*t*y2 + t*t*t;
+    let lo = 0, hi = 1;
+    for (let i = 0; i < 40; i++) {
+      const m = (lo + hi) / 2;
+      if (bx(m) < x) lo = m; else hi = m;
+    }
+    return by((lo + hi) / 2);
+  };
+  /* When does the fill, shrinking from full to empty, pass `frac` across? */
+  const edgeReaches = frac => {
+    let lo = 0, hi = DRAIN_MS;
+    for (let i = 0; i < 40; i++) {
+      const m = (lo + hi) / 2;
+      if (1 - bezY(.2, .6, .1, 1, m / DRAIN_MS) > frac) lo = m; else hi = m;
+    }
+    return (lo + hi) / 2;
+  };
+  /* A ring of dots reused round-robin. Two seconds' worth are in flight at
+     once, so the ring only has to be comfortably larger than that. */
+  for (let i = 0; i < 14; i++) {
+    const b = document.createElement("b");
+    b.style.setProperty("--s", rnd(1.5, 3.2).toFixed(1) + "px");
+    wakeEl.appendChild(b);
+  }
+
+  const N = 16;
+  for (let i = 0; i < N; i++) {
+    const x = (i + 0.5) / N;
+    const b = document.createElement("b");
+    b.style.setProperty("--x", (x * 100).toFixed(1) + "%");
+    b.style.setProperty("--dx", rnd(-14, -3).toFixed(1) + "px");
+    /* Biased downward so the spray falls away rather than hanging. */
+    b.style.setProperty("--dy", rnd(-4, 10).toFixed(1) + "px");
+    b.style.setProperty("--t", (edgeReaches(x) / 1000).toFixed(3) + "s");
+    trailEl.appendChild(b);
+  }
+})();
+
+const pad2 = n => String(n).padStart(2, "0");
+
+function formatDate(d) {
+  const day = d.getDate(), mon = d.getMonth(), yr = d.getFullYear();
+  switch (String(props.dateformat)) {
+    case "wdshort":
+      return DAY_NAMES[d.getDay()].slice(0, 3) + ", " + day + " " +
+             MONTH_NAMES[mon].slice(0, 3) + " " + yr;
+    case "dmy": return pad2(day) + "/" + pad2(mon + 1) + "/" + yr;
+    case "mdy": return pad2(mon + 1) + "/" + pad2(day) + "/" + yr;
+    case "iso": return yr + "-" + pad2(mon + 1) + "-" + pad2(day);
+    default:
+      return DAY_NAMES[d.getDay()] + ", " + day + " " + MONTH_NAMES[mon] + " " + yr;
+  }
+}
+
+/* Render `text` into `el`, one fixed-width box per character. Only boxes
+   whose character actually changed roll; the rest are left alone. */
+function setDigits(el, text, animate) {
+  /* A box on its way out stays in the DOM until its roll finishes, so it has
+     to be excluded from the count and from indexing while it lingers. */
+  const live = () => [].filter.call(el.children, b => !b.classList.contains("gone"));
+
+  while (live().length < text.length) {
+    const box = document.createElement("span");
+    box.className = animate ? "dg fresh" : "dg";
+    if (animate) setTimeout(() => box.classList.remove("fresh"), 560);
+    el.appendChild(box);
+  }
+  while (live().length > text.length) {
+    const rows = live();
+    const box = rows[rows.length - 1];
+    if (!animate) { el.removeChild(box); continue; }
+    /* Roll the glyph out and collapse the box's width at the same time, so
+       the surviving digits slide across instead of snapping. */
+    box.classList.add("gone");
+    const cur = box.querySelector("span:not(.out)");
+    if (cur) { cur.classList.remove("in"); cur.classList.add("out"); }
+    setTimeout(() => { if (box.parentNode) box.parentNode.removeChild(box); }, 540);
+  }
+
+  const boxes = live();
+  for (let i = 0; i < text.length; i++) {
+    const box = boxes[i];
+    const cur = box.querySelector("span:not(.out)");
+    if (cur && cur.textContent === text[i]) continue;
+
+    if (cur && animate) {
+      cur.classList.remove("in");
+      cur.classList.add("out");
+      const dying = cur;
+      setTimeout(() => { if (dying.parentNode) dying.parentNode.removeChild(dying); }, 520);
+    } else if (cur) {
+      box.removeChild(cur);
+    }
+
+    const nu = document.createElement("span");
+    if (animate) nu.className = "in";
+    nu.textContent = text[i];
+    box.appendChild(nu);
+  }
+}
+
+/* Same roll as the clock digits, for proportional text. Only characters
+   that actually changed animate, and they start in sequence left to right
+   so a date change reads as a wave rather than everything twitching at
+   once. Costs nothing in practice - the date changes once a day. */
+function setChars(el, text, animate) {
+  while (el.children.length < text.length) {
+    const box = document.createElement("span");
+    box.className = "ch";
+    el.appendChild(box);
+  }
+  while (el.children.length > text.length) el.removeChild(el.lastChild);
+
+  let nth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const box = el.children[i];
+    const cur = box.querySelector("span:not(.out)");
+    if (cur && cur.textContent === text[i]) continue;
+
+    const delay = animate ? Math.min(nth * 45, 520) : 0;
+    nth++;
+
+    if (cur && animate) {
+      cur.classList.remove("in");
+      cur.classList.add("out");
+      cur.style.animationDelay = delay + "ms";
+      const dying = cur;
+      setTimeout(() => { if (dying.parentNode) dying.parentNode.removeChild(dying); },
+                 delay + 620);
+    } else if (cur) {
+      box.removeChild(cur);
+    }
+
+    const nu = document.createElement("span");
+    if (animate) { nu.className = "in"; nu.style.animationDelay = delay + "ms"; }
+    nu.textContent = text[i];
+    box.appendChild(nu);
+  }
+}
+
+let lastDateTxt = null;
+
+/* Release a spent second at the crest. It drifts back and up, slowing as it
+   goes, and fades out over a couple of seconds - so at any moment there is a
+   short wake of the last few seconds hanging behind the bar, each one a
+   little further gone than the last. */
+let wakeIdx = 0;
+/* Set when the drain releases the bar, consumed by the very next tick. */
+let catchUp = false;
+/* True while a two-second catch-up transition is still in flight, so the
+   tick that lands in the middle of it leaves the width alone. */
+let coasting = false;
+function emitSecond(pct) {
+  if (!wakeEl.children.length) return;
+  const n = 1 + (Math.random() < 0.45 ? 1 : 0);
+  for (let i = 0; i < n; i++) {
+    const dot = wakeEl.children[wakeIdx++ % wakeEl.children.length];
+    dot.style.left = pct;
+    const dx = -(5 + Math.random() * 26);
+    const dy = -(3 + Math.random() * 13);
+    dot.animate([
+      { opacity: 0,   transform: "translate(0,0) scale(.3)" },
+      { opacity: .95, transform: "translate(" + (dx * .16).toFixed(1) + "px," +
+                                  (dy * .18).toFixed(1) + "px) scale(1)", offset: .14 },
+      { opacity: 0,   transform: "translate(" + dx.toFixed(1) + "px," +
+                                  dy.toFixed(1) + "px) scale(.15)" }
+    ], {
+      duration: 1900 + Math.random() * 1500,
+      /* Fast away from the crest, then almost drifting - the second is spent
+         quickly and then lingers just long enough to watch it go. */
+      easing: "cubic-bezier(.12,.65,.25,1)",
+      fill: "forwards"
+    });
+  }
+}
+
+function paintClock(force) {
+  const on = props.showclock !== false;
+  clockEl.classList.toggle("off", !on);
+  if (!on) return;
+  /* Position is a setting because the right spot depends on the scene, not
+     on the wallpaper - the clock wants to sit clear of whatever the footage's
+     focal point is, and that moves with the season and the shot.
+     The clock is centred on its own anchor, so half of it sits either side.
+     Clamping the anchor by that half-size keeps the whole block on screen at
+     the extremes instead of letting it hang off the edge - and it is measured
+     live, so it holds regardless of font size, time format or date length. */
+  positionClock();
+
+  const d = new Date();
+  const use12 = String(props.timeformat) === "12";
+  const h24 = d.getHours();
+  const h = use12 ? (h24 % 12 || 12) : h24;
+
+  const anim = !force;
+  setDigits(hhEl, use12 ? String(h) : pad2(h), anim);
+  setDigits(mmEl, pad2(d.getMinutes()), anim);
+  setDigits(secEl, pad2(d.getSeconds()), anim);
+
+  /* Rolled rather than swapped, so noon and midnight turn over with the
+     same motion as the digits beside them. Not animated on a forced repaint,
+     which is what a settings change does - only on a real crossing. */
+  const ampm = use12 ? (h24 < 12 ? "AM" : "PM") : "";
+  if (ampmEl.textContent !== ampm) setChars(ampmEl, ampm, anim);
+
+  const dateTxt = formatDate(d);
+  if (force || dateTxt !== lastDateTxt) {
+    setChars(dateEl, dateTxt, anim && lastDateTxt !== null);
+    lastDateTxt = dateTxt;
+  }
+
+  /* Minute sweep. On the wrap it has to snap back instantly - left to
+     transition it would glide backwards across the full width. */
+  const secs = d.getSeconds();
+  if (secs === 0) {
+    /* Sweep back to the left rather than snapping. This is the one place an
+       eased curve belongs - the return is a gesture, not a measurement, so
+       it should let go softly and settle softly. */
+    barEl.classList.add("rewind");
+    barEl.classList.add("shedding");
+    barFill.style.width = "0%";
+    sparkEl.style.left = "0%";
+    /* Outlives .rewind. The last dot starts when the edge reaches the far
+       left, near the end of the 1250ms drain, and then runs 800ms - so the
+       class has to survive past roughly 2s. */
+    setTimeout(() => barEl.classList.remove("shedding"), 2200);
+    setTimeout(() => {
+      barEl.classList.remove("rewind");
+      catchUp = true;
+    }, 1300);
+  } else {
+    /* Aim at where the bar should be one second from now, not where it is.
+       The transition is exactly one second and linear, so each second's
+       motion ends precisely where the next begins - the bar glides for the
+       whole minute instead of taking 60 visible steps. */
+    /* Writing a new width into the middle of the drain would cut it short and
+       snap the bar forward, so ticks landing during it are left alone. */
+    if (!barEl.classList.contains("rewind")) {
+      if (catchUp) {
+        /* Aim two seconds ahead and hold the transition open across the tick
+           in between, so the lost ground is recovered gradually. */
+        catchUp = false;
+        coasting = true;
+        barEl.classList.add("catchup");
+        const pct = ((secs + 2) / 60 * 100).toFixed(2) + "%";
+        barFill.style.width = pct;
+        sparkEl.style.left = pct;
+      } else if (coasting) {
+        /* Mid catch-up. The transition is still running and already heading
+           to the right place, so this tick only spends its second. */
+        coasting = false;
+      } else {
+        /* Cleared here rather than on a timer: by now the catch-up
+           transition has run its full two seconds, so removing the class
+           cannot disturb it, and there is no race with this tick. */
+        barEl.classList.remove("catchup");
+        const pct = ((secs + 1) / 60 * 100).toFixed(2) + "%";
+        barFill.style.width = pct;
+        sparkEl.style.left = pct;
+      }
+      /* Read the crest off the live element rather than assuming it is where
+         the clock says - during a catch-up the bar is still behind, and a dot
+         placed on the nominal position would detach from the edge. Skipped on
+         a forced repaint so a settings change does not spray particles. */
+      if (!force) {
+        const bw = barEl.getBoundingClientRect().width || 1;
+        const fw = barFill.getBoundingClientRect().width;
+        emitSecond((fw / bw * 100).toFixed(2) + "%");
+      }
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * New Year
+ *
+ * Two phases: a ten-second build-up, then the moment itself. Anything
+ * that changes once a second rides the existing clock tick; the confetti
+ * gets a requestAnimationFrame loop that is started when the year turns
+ * and stopped when the last piece falls off screen, so this whole file
+ * costs nothing at all for the other 364 days.
+ * ------------------------------------------------------------------ */
+const nyEl     = document.getElementById("ny");
+const nyVeil   = document.getElementById("nyveil");
+const nyDisc   = document.getElementById("nydisc");
+const nyCount  = document.getElementById("nycount");
+const nyRing   = document.getElementById("nyring");
+const nyBanner = document.getElementById("nybanner");
+const nyTitle  = document.getElementById("nytitle");
+const nyYear   = document.getElementById("nyyear");
+const nyCanvas = document.getElementById("nyfx");
+
+const NY_LEAD = 10;   // seconds of build-up
+const NY_HOLD = 26;   // seconds the banner stays up afterwards
+
+let nyFull = true;        // does this screen run the full countdown?
+
+/* Each monitor runs its own copy of this wallpaper and they cannot talk to
+   each other directly - but they do share an origin, so localStorage is
+   common ground. A screen showing the clock leaves a heartbeat there; a
+   screen without one checks for it.
+   The rule that comes out of this: the countdown plays wherever the clock
+   is, and screens without a clock only dim. If no screen has a clock at all
+   there is no heartbeat, and then every screen plays it in full so the
+   moment is not missed entirely.
+   Beating only near midnight keeps it from touching storage the rest of the
+   year, and every access is guarded - if storage is unavailable the fallback
+   is the generous one, playing in full. */
+const NY_BEAT_KEY = "rtss_clock_present";
+function nyBeat() {
+  if (props.showclock === false) return;
+  try { localStorage.setItem(NY_BEAT_KEY, String(Date.now())); } catch (e) {}
+}
+function nyClockOnAnotherScreen() {
+  try {
+    const v = Number(localStorage.getItem(NY_BEAT_KEY));
+    return isFinite(v) && v > 0 && Date.now() - v < 4000;
+  } catch (e) { return false; }
+}
+let nyLastCount = null;
+let nyArmed     = false;
+let nyRaf       = 0;
+
+/* Which January 1st is nearest, and how many seconds we are from it -
+   negative before, positive after. Measuring against the nearer boundary
+   means this reads correctly on both sides of the turn. */
+function nyNearestTurn() {
+  const now = new Date();
+  const a = new Date(now.getFullYear(), 0, 1, 0, 0, 0, 0);
+  const b = new Date(now.getFullYear() + 1, 0, 1, 0, 0, 0, 0);
+  return Math.abs(now - a) < Math.abs(now - b) ? a : b;
+}
+function nyOffset() {
+  return (new Date() - nyNearestTurn()) / 1000;
+}
+function nyIncomingYear() {
+  return nyNearestTurn().getFullYear();
+}
+
+/* Split into per-letter spans so they can be staggered in. */
+function nySetText(el, text) {
+  el.textContent = "";
+  [...text].forEach((ch, i) => {
+    const sp = document.createElement("span");
+    sp.textContent = ch;
+    sp.style.opacity = "0";
+    el.appendChild(sp);
+    sp.animate(
+      [ { opacity: 0, transform: "translateY(.42em) rotateX(-70deg)" },
+        { opacity: 1, transform: "translateY(0) rotateX(0)" } ],
+      { duration: 620, delay: 120 + i * 45,
+        easing: "cubic-bezier(.2,.9,.25,1)", fill: "forwards" });
+  });
+}
+
+function nyShowCount(n) {
+  nyCount.textContent = n;
+  /* Pure scale - the grid does the centring, so these cannot displace it. */
+  nyCount.animate(
+    [ { opacity: 0, transform: "scale(2.6)", filter: "blur(14px)" },
+      { opacity: 1, transform: "scale(1)",   filter: "blur(0px)", offset: .34 },
+      { opacity: 1, transform: "scale(1)",   filter: "blur(0px)", offset: .72 },
+      { opacity: 0, transform: "scale(.86)", filter: "blur(3px)" } ],
+    { duration: 980, easing: "cubic-bezier(.15,.85,.25,1)", fill: "forwards" });
+  nyRing.animate(
+    [ { opacity: .7, transform: "scale(.86)" },
+      { opacity: 0,  transform: "scale(1.5)" } ],
+    { duration: 980, easing: "cubic-bezier(.1,.7,.3,1)", fill: "forwards" });
+  /* The standing circle tightens a little on each beat. */
+  nyDisc.animate(
+    [ { transform: "scale(1.03)" }, { transform: "scale(1)" } ],
+    { duration: 620, easing: "cubic-bezier(.2,.8,.3,1)", fill: "forwards" });
+}
+
+/* ---- confetti ---- */
+const nyBits = [];
+let nyCtx = null, nySpawnUntil = 0, nyLastT = 0, nyAccum = 0;
+/* Pieces per second, and a hard ceiling on how many may exist at once.
+   Both are wall-clock quantities on purpose: spawning per frame would put
+   three times as much confetti on a 180Hz monitor as on a 60Hz one, and the
+   ceiling keeps the cost bounded no matter what the refresh rate is.
+   NY_MAX is set from the fall time - roughly 4.5s to cross a tall screen at
+   terminal velocity - so NY_RATE x fall time lands just under the cap. */
+const NY_RATE = 55;
+const NY_MAX  = 320;
+const NY_COLORS = ["#ffd977", "#ff8fc7", "#b39dff", "#7fe6ff",
+                   "#9dffc8", "#ffffff", "#ffb347"];
+
+function nySize() {
+  const r = Math.min(window.devicePixelRatio || 1, 1.5);
+  nyCanvas.width  = Math.max(1, Math.round(nyCanvas.clientWidth  * r));
+  nyCanvas.height = Math.max(1, Math.round(nyCanvas.clientHeight * r));
+  nyCtx = nyCanvas.getContext("2d");
+  nyCtx.setTransform(r, 0, 0, r, 0, 0);
+}
+
+function nySpawn(n) {
+  const w = nyCanvas.clientWidth;
+  for (let i = 0; i < n; i++) {
+    nyBits.push({
+      x: Math.random() * w,
+      y: -20 - Math.random() * 140,
+      vx: (Math.random() - .5) * 1.7,
+      vy: 1.4 + Math.random() * 2.6,
+      w: 5 + Math.random() * 7,
+      h: 8 + Math.random() * 10,
+      rot: Math.random() * Math.PI * 2,
+      vrot: (Math.random() - .5) * .22,
+      /* Its own sway phase, so the fall never looks ranked. */
+      phase: Math.random() * Math.PI * 2,
+      sway: .4 + Math.random() * 1.1,
+      col: NY_COLORS[(Math.random() * NY_COLORS.length) | 0]
+    });
+  }
+}
+
+function nyFrame(t) {
+  const w = nyCanvas.clientWidth, h = nyCanvas.clientHeight;
+  /* Everything below is scaled by k, the frame's length in 60ths of a
+     second, so the confetti falls at the same real-world speed whether the
+     display runs at 60Hz or 180. Clamped so a dropped frame or a paused tab
+     cannot teleport every piece off screen in one step. */
+  if (!nyLastT) nyLastT = t;
+  const dt = Math.min((t - nyLastT) / 1000, .05);
+  nyLastT = t;
+  const k = dt * 60;
+
+  if (t < nySpawnUntil && nyBits.length < NY_MAX) {
+    nyAccum += dt * NY_RATE;
+    const n = Math.floor(nyAccum);
+    if (n > 0) {
+      nyAccum -= n;
+      nySpawn(Math.min(n, NY_MAX - nyBits.length));
+    }
+  }
+  nyCtx.clearRect(0, 0, w, h);
+  for (let i = nyBits.length - 1; i >= 0; i--) {
+    const b = nyBits[i];
+    b.phase += .07 * k;
+    b.vy = Math.min(b.vy + .055 * k, 5.2);      // gravity, terminal velocity
+    b.x += (b.vx + Math.sin(b.phase) * b.sway) * k;
+    b.y += b.vy * k;
+    b.rot += b.vrot * k;
+    if (b.y > h + 40) { nyBits.splice(i, 1); continue; }
+    nyCtx.save();
+    nyCtx.translate(b.x, b.y);
+    nyCtx.rotate(b.rot);
+    nyCtx.globalAlpha = .95;
+    nyCtx.fillStyle = b.col;
+    /* Squashing the height on the sway phase fakes the piece turning
+       edge-on, which is most of what sells it as paper. */
+    nyCtx.fillRect(-b.w / 2, -b.h / 2, b.w, b.h * Math.abs(Math.cos(b.phase)));
+    nyCtx.restore();
+  }
+  if (nyBits.length || t < nySpawnUntil) {
+    nyRaf = requestAnimationFrame(nyFrame);
+  } else {
+    nyRaf = 0;
+    nyCtx.clearRect(0, 0, w, h);
+  }
+}
+
+/* The disc sweeps outward past the edges of the screen while the veil
+   lifts on the same curve, so the scene is uncovered by the circle rather
+   than merely at the same time as it. */
+function nyReveal() {
+  nyEl.classList.add("reveal");
+  /* Cleared here rather than left to the stylesheet's !important to beat
+     them. Same visual result, but the veil no longer depends on a
+     specificity fight to come back up. */
+  nyVeil.style.background = "rgba(0,0,0,0)";
+  nyVeil.style.backdropFilter = "blur(0px)";
+  nyVeil.style.webkitBackdropFilter = "blur(0px)";
+  nyCount.getAnimations().forEach(a => a.cancel());
+  nyCount.textContent = "";
+  /* Only where a circle was actually drawn. A screen that merely dimmed
+     never had one, so opening a ring out of nowhere there would read as a
+     glitch rather than a reveal - it just lifts the veil instead. */
+  if (nyFull) {
+    /* Far enough to clear the corners of any aspect ratio. */
+    nyDisc.animate(
+      [ { opacity: .55, transform: "scale(1)",  borderWidth: "2px" },
+        { opacity: .28, transform: "scale(6)",  borderWidth: "6px", offset: .55 },
+        { opacity: 0,   transform: "scale(14)", borderWidth: "10px" } ],
+      { duration: 900, easing: "cubic-bezier(.2,.75,.25,1)", fill: "forwards" });
+  }
+}
+
+function nyCelebrate() {
+  nySetText(nyTitle, "HAPPY NEW YEAR");
+  nySetText(nyYear, String(nyIncomingYear()));
+  nyBanner.animate(
+    [ { opacity: 0, transform: "translateY(-50%) scale(.92)" },
+      { opacity: 1, transform: "translateY(-50%) scale(1)" } ],
+    { duration: 900, easing: "cubic-bezier(.2,.9,.25,1)", fill: "forwards" });
+  nySize();
+  nyBits.length = 0;
+  nyLastT = 0;
+  nyAccum = 0;
+  nySpawnUntil = performance.now() + 5200;
+  nySpawn(90);
+  if (!nyRaf) nyRaf = requestAnimationFrame(nyFrame);
+}
+
+function nyEnd() {
+  nyArmed = false;
+  nyLastCount = null;
+  document.body.classList.remove("nybuild");
+  nyEl.classList.remove("reveal");
+  document.body.style.setProperty("--ny", 0);
+  nyVeil.style.background = "rgba(0,0,0,0)";
+  nyVeil.style.backdropFilter = "blur(0px)";
+  nyVeil.style.webkitBackdropFilter = "blur(0px)";
+  nyDisc.getAnimations().forEach(a => a.cancel());
+  nyDisc.style.opacity = "0";
+  nyBanner.animate([{ opacity: 1 }, { opacity: 0 }],
+                   { duration: 900, fill: "forwards" });
+  /* Held open until the fade finishes and any remaining confetti lands. */
+  setTimeout(() => { if (!nyArmed) nyEl.classList.remove("on"); }, 1000);
+}
+
+/* Called once a second from the clock tick. */
+function nyUpdate() {
+  const t = nyOffset();
+
+  /* Announce this screen's clock while the turn is close, so screens
+     without one can see whether the countdown belongs elsewhere. */
+  if (t > -120 && t < NY_HOLD) nyBeat();
+
+  if (t >= -NY_LEAD && t < 0) {
+    if (!nyArmed) {
+      nyArmed = true;
+      /* Decided once, at the top of the countdown, so the screen cannot
+         change its mind halfway through. */
+      nyFull = props.showclock !== false || !nyClockOnAnotherScreen();
+      nyEl.classList.add("on");
+      nyEl.classList.remove("reveal");
+      nyBanner.style.opacity = "0";
+      if (nyFull) {
+        document.body.classList.add("nybuild");
+        nyDisc.animate([{ opacity: 0 }, { opacity: .55 }],
+                       { duration: 900, fill: "forwards" });
+      }
+    }
+    /* 0 at ten seconds out, 1 at the turn. */
+    const p = 1 + t / NY_LEAD;
+    document.body.style.setProperty("--ny", p.toFixed(3));
+    /* A screen that is only dimming stays lighter - it is context for the
+       one running the countdown, not the main event. */
+    const dark = (nyFull ? .74 : .45) * p;
+    const blur = (nyFull ? 15 : 8) * p;
+    nyVeil.style.background = "rgba(0,0,0," + dark.toFixed(3) + ")";
+    nyVeil.style.backdropFilter = "blur(" + blur.toFixed(1) + "px)";
+    nyVeil.style.webkitBackdropFilter = "blur(" + blur.toFixed(1) + "px)";
+
+    if (nyFull) {
+      const n = Math.max(1, Math.ceil(-t));
+      if (n !== nyLastCount) { nyLastCount = n; nyShowCount(n); }
+    } else {
+      nyLastCount = Math.max(1, Math.ceil(-t));
+    }
+
+  } else if (t >= 0 && t < NY_HOLD) {
+    if (nyLastCount !== 0) {
+      nyLastCount = 0;
+      nyArmed = true;
+      nyEl.classList.add("on");
+      document.body.style.setProperty("--ny", 0);
+      document.body.classList.remove("nybuild");
+      nyReveal();
+      /* Confetti follows the reveal rather than landing on top of it. */
+      if (nyFull) setTimeout(nyCelebrate, 460);
+    }
+
+  } else if (nyArmed) {
+    nyEnd();
+  }
+}
+
+window.addEventListener("resize", () => {
+  if (nyRaf) nySize();
+  positionClock();   /* the clamp depends on viewport size */
+});
+
+/* Tick on the second boundary rather than every 1000ms from an arbitrary
+   start, so the display flips when the clock really does. Re-armed each
+   time because setInterval would slowly drift off the boundary. */
+function scheduleClock() {
+  setTimeout(() => { paintClock(false); nyUpdate(); scheduleClock(); },
+             1000 - (Date.now() % 1000) + 8);
+}
+paintClock(true);
+clockEl.classList.add("intro");
+setTimeout(() => clockEl.classList.remove("intro"), 1200);
+scheduleClock();
+
+function update() {
+  const lat = activeLat(), lng = activeLng();
+  const now = virtualNow();
+
+  const season = props.realseason
+    ? seasonFor(now, lat)
+    : props.fixedseason;
+
+  const tick = props.realtime
+    ? timeToTick(now, lat, lng)
+    : hoursToTick(props.fixedtime);
+
+  /* Each season is filmed in a completely different location, so a
+     season change is a cut between two unrelated scenes - crossfading
+     them would look like a mistake. Fade out to black and back instead.
+     Compared on the RESOLVED season, so seasons that fall back to the
+     same footage do not trigger a pointless blackout. */
+  const resolved = resolveSeason(season);
+  const seasonChanged = lastSeason !== null && resolved !== lastSeason;
+  lastSeason = resolved;
+
+  const dir = "videos/" + resolved + "/";
+
+  // Transitions only make sense against a moving clock.
+  const trans = props.realtime ? activeTransition(now, lat, lng) : null;
+
+  let label;
+  if (trans) {
+    label = trans.tr.file + "  (transition +" + Math.round(trans.offset) + "s)";
+    show(dir + trans.tr.file, {
+      loop: false,
+      seek: trans.offset,
+      blackout: seasonChanged,
+      rate: speed()
+    });
+  } else {
+    const clip = pickClip(tick);
+    label = clip.file;
+    show(dir + clip.file, { blackout: seasonChanged, rate: speed() });
+  }
+
+  /* Apply the speed to whatever is already on screen too. show() only sets
+     the rate on a clip it is loading and bails out early when the source has
+     not changed, so without this the slider would do nothing until the next
+     swap - which at 1x is never. */
+  const rate = speed();
+  for (const v of vids) if (v.playbackRate !== rate) v.playbackRate = rate;
+
+  if (props.showdebug || lastError) {
+    const st = solarTimes(now, lat, lng);
+    const fmt = d => d ? d.toTimeString().slice(0, 8) : "--:--:--";
+    const v = vids[front];
+    dbg.textContent =
+      (lastError ? "VIDEO ERROR\n  " + lastError + "\n\n" : "") +
+      "clock    " + now.toTimeString().slice(0, 8) +
+        (speed() > 1 ? "  (x" + speed() + ")" : "") + "\n" +
+      "location " + lat.toFixed(2) + ", " + lng.toFixed(2) + (props.autolongitude ? "  (lng auto)" : "") + "\n" +
+      "sunrise  " + (st.polar ? "polar " + st.polar : fmt(st.sunrise)) + "\n" +
+      "sunset   " + (st.polar ? "polar " + st.polar : fmt(st.sunset)) + "\n" +
+      "tick     " + Math.round(tick) + "\n" +
+      "season   " + season + (resolveSeason(season) !== season ? "  -> " + FALLBACK + " (no footage yet)" : "") + "\n" +
+      "clip     " + label + "\n" +
+      "next     " + nextTransitionInfo(now, lat, lng) + "\n" +
+      "video    readyState=" + v.readyState + " net=" + v.networkState +
+        " " + v.videoWidth + "x" + v.videoHeight + (v.paused ? " PAUSED" : " playing") + "\n" +
+      "codecs   " + codecReport();
+  }
+  dbg.classList.toggle("on", !!props.showdebug);
+  dbg.classList.toggle("err", !!lastError);
+}
+
+/* ------------------------------------------------------------------
+   Wallpaper Engine property bridge.
+------------------------------------------------------------------ */
+window.wallpaperPropertyListener = {
+  applyUserProperties: function (p) {
+    for (const key in p) {
+      if (key in props && p[key] && p[key].value !== undefined) {
+        props[key] = p[key].value;
+      }
+    }
+    update();
+    paintClock(true);   // apply format / visibility changes without waiting a tick
+  }
+};
+
+update();
+setInterval(update, 1000);
+</script>
