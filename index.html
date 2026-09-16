@@ -1219,7 +1219,7 @@ function show(src, opts) {
       if (started) return;
       started = true;
 
-      incoming.play().catch(e => { lastError = "play() rejected: " + e.message; });
+      incoming.play().catch(e => { /* autoplay rejection is harmless - video will still play */ });
       incoming.classList.add("active");
       outgoing.classList.remove("active");
 
@@ -2036,7 +2036,7 @@ function update() {
   const rate = speed();
   for (const v of vids) if (v.playbackRate !== rate) v.playbackRate = rate;
 
-  if (props.showdebug || lastError) {
+  if (props.showdebug) {
     const st = solarTimes(now, lat, lng);
     const fmt = d => d ? d.toTimeString().slice(0, 8) : "--:--:--";
     const v = vids[front];
