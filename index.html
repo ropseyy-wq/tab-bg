@@ -2,10 +2,13 @@
 <meta charset="utf-8">
 <title>Real-Time Solar Seasons</title>
 <style>
-  html, body {
+    html, body {
     margin: 0; padding: 0; width: 100%; height: 100%;
     background: #000; overflow: hidden;
+    opacity: 0;
+    transition: opacity 0.8s ease;
   }
+  html.ready, body.ready { opacity: 1; }
   .layer {
     position: absolute; top: 0; left: 0;
     width: 100%; height: 100%;
@@ -2106,7 +2109,35 @@ window.wallpaperPropertyListener = {
     }
   } catch (e) { /* malformed URL, use defaults */ }
 })();
+/* ------------------------------------------------------------------
+   Aggressive autoplay enforcement.
+   Android WebView revokes autoplay permission when the app is
+   backgrounded, and re-engages it only on a user gesture. This
+   polls the two video elements every 500ms and calls play() on
+   any that are paused, and re-triggers on visibilitychange so a
+   screen-wake also resumes playback.
+------------------------------------------------------------------ */
+(function enforceAutoplay() {
+  const tryPlay = () => {
+    for (const v of vids) {
+      if (v && v.paused && v.readyState >= 2) {
+        v.play().catch(() => { /* silent - will retry next tick */ });
+      }
+    }
+  };
 
+  setInterval(tryPlay, 500);
+
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) setTimeout(tryPlay, 100);
+  });
+
+  window.addEventListener("focus", tryPlay);
+  window.addEventListener("pageshow", tryPlay);
+
+  setTimeout(tryPlay, 1000);
+  setTimeout(tryPlay, 3000);
+})();
 update();
 setInterval(update, 1000);
 
