@@ -25,22 +25,25 @@
      "0", so the whole line twitches sideways every single second. */
   #clock {
     position: absolute;
-    /* Horizontally centred, sitting a little above the vertical middle.
-       Dead centre lands the clock on whatever the scene's focal point is -
-       in this world, straight onto a tree trunk. These are only the values
-       used before the user's own settings arrive; the sliders own it after
-       that. */
     left: 50%; top: 42%;
     transform: translate(-50%, -50%);
     z-index: 2;
     text-align: center;
-    color: #fff;
-    font-family: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+    font-family: "Minecraft", "Minecraftia", "Press Start 2P",
+                 "Consolas", "Courier New", monospace;
     font-variant-numeric: tabular-nums;
     font-feature-settings: "tnum" 1;
-    /* Two shadows: a wide soft one to lift the text off bright sky, and a
-       tight dark one to keep edges crisp against pale clouds. */
-    text-shadow: 0 2px 22px rgba(0,0,0,.55), 0 1px 4px rgba(0,0,0,.45);
+    color: #fff;
+    background: rgba(20, 20, 30, 0.42);
+    -webkit-backdrop-filter: blur(8px);
+            backdrop-filter: blur(8px);
+    padding: 18px 30px 14px 30px;
+    border-radius: 6px;
+    border: 2px solid rgba(255, 255, 255, 0.14);
+    box-shadow:
+      0 8px 32px rgba(0, 0, 0, 0.45),
+      inset 0 1px 0 rgba(255, 255, 255, 0.10);
+    text-shadow: 2px 2px 0 rgba(0, 0, 0, 0.85);
     pointer-events: none;
     user-select: none;
     transition: opacity .6s ease;
@@ -51,10 +54,10 @@
     display: flex;
     align-items: flex-start;
     justify-content: center;
-    font-size: clamp(44px, 9.5vh, 168px);
-    font-weight: 200;
+    font-size: clamp(28px, 6vh, 96px);
+    font-weight: 400;
     line-height: 1;
-    letter-spacing: -.01em;
+    letter-spacing: .04em;
   }
 
   /* Each digit is a fixed-size window with the glyphs stacked inside it.
@@ -849,7 +852,7 @@ const props = {
   longitude: "-73.2",
   autolongitude: true,
   showclock: true,
-  timeformat: "24",     // "12" | "24"
+  timeformat: "12",     // "12" | "24"
   dateformat: "wdshort",
   timescale: 1,
   clockx: 50,
@@ -2070,7 +2073,37 @@ window.wallpaperPropertyListener = {
     paintClock(true);   // apply format / visibility changes without waiting a tick
   }
 };
+(function applyUrlOverrides() {
+  try {
+    const params = new URLSearchParams(location.search);
 
+    if (params.get("clock") === "off") props.showclock = false;
+    if (params.get("clock") === "on")  props.showclock = true;
+
+    const pos = (params.get("pos") || "").toLowerCase();
+    const preset = {
+      "top":          { x: 50, y: 20 },
+      "top-center":   { x: 50, y: 20 },
+      "upper":        { x: 50, y: 35 },
+      "center":       { x: 50, y: 50 },
+      "middle":       { x: 50, y: 50 },
+      "lower":        { x: 50, y: 65 },
+      "bottom":       { x: 50, y: 80 },
+      "bottom-center":{ x: 50, y: 80 },
+      "topleft":      { x: 20, y: 20 },
+      "topright":     { x: 80, y: 20 },
+      "bottomleft":   { x: 20, y: 80 },
+      "bottomright":  { x: 80, y: 80 }
+    }[pos];
+    if (preset) {
+      props.clockx = preset.x;
+      props.clocky = preset.y;
+    }
+  } catch (e) { /* malformed URL, use defaults */ }
+})();
+
+update();
+setInterval(update, 1000);
 update();
 setInterval(update, 1000);
 </script>
