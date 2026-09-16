@@ -677,16 +677,16 @@
    onto the footage.
 ------------------------------------------------------------------ */
 const CLIPS = [
-  { tick:   440, file: "01_dawn_t00440.mp4"      },
-  { tick:  1920, file: "02_morning_t01920.mp4"   },
-  { tick:  3820, file: "03_latemorning_t03820.mp4" },
-  { tick:  6000, file: "04_noon_t06000.mp4"      },
-  { tick:  9000, file: "05_afternoon_t09000.mp4" },
-  { tick: 12000, file: "06_sunset_t12000.mp4"    },
-  { tick: 13840, file: "07_night_t13840.mp4"     },
-  { tick: 16360, file: "08_latenight_t16360.mp4" },
-  { tick: 22400, file: "09_predawn_t22400.mp4"   },
-  { tick: 23220, file: "10_firstlight_t23220.mp4"}
+  { tick:   440, file: "01_Dawn_T00440.mp4"      },
+  { tick:  1920, file: "02_Morning_T01920.mp4"   },
+  { tick:  3820, file: "03_Latemorning_T03820.mp4" },
+  { tick:  6000, file: "04_Noon_T06000.mp4"      },
+  { tick:  9000, file: "05_Afternoon_T09000.mp4" },
+  { tick: 12000, file: "06_Sunset_T12000.mp4"    },
+  { tick: 13840, file: "07_Night_T13840.mp4"     },
+  { tick: 16360, file: "08_Latenight_T16360.mp4" },
+  { tick: 22400, file: "09_Predawn_T22400.mp4"   },
+  { tick: 23220, file: "10_Firstlight_T23220.mp4"}
 ];
 
 /* Recorded transitions. Each one plays ONCE at natural speed and is
@@ -718,16 +718,16 @@ const CLIPS = [
         22400   ->  t_to_firstlight   ->    23220
 */
 const TRANSITIONS = [
-  { end:   440, dur:  50, file: "t_to_dawn.mp4"        },
-  { end:  1920, dur:  68, file: "t_to_morning.mp4"     },
-  { end:  3820, dur:  81, file: "t_to_latemorning.mp4" },
-  { end:  6000, dur: 108, file: "t_to_noon.mp4"        },
-  { end:  9000, dur: 150, file: "t_to_afternoon.mp4"   },
-  { end: 12000, dur: 145, file: "t_to_sunset.mp4"      },
-  { end: 13840, dur:  84, file: "t_to_night.mp4"       },
-  { end: 16360, dur: 119, file: "t_to_latenight.mp4"   },
-  { end: 22400, dur: 295, file: "t_to_predawn.mp4"     },
-  { end: 23220, dur:  37, file: "t_to_firstlight.mp4"  }
+  { end:   440, dur:  50, file: "T_To_Dawn.mp4"        },
+  { end:  1920, dur:  68, file: "T_To_Morning.mp4"     },
+  { end:  3820, dur:  81, file: "T_To_Latemorning.mp4" },
+  { end:  6000, dur: 108, file: "T_To_Noon.mp4"        },
+  { end:  9000, dur: 150, file: "T_To_Afternoon.mp4"   },
+  { end: 12000, dur: 145, file: "T_To_Sunset.mp4"      },
+  { end: 13840, dur:  84, file: "T_To_Night.mp4"       },
+  { end: 16360, dur: 119, file: "T_To_Latenight.mp4"   },
+  { end: 22400, dur: 295, file: "T_To_Predawn.mp4"     },
+  { end: 23220, dur:  37, file: "T_To_Firstlight.mp4"  }
 ];
 
 /* Crossfade length between clips, in seconds. Fixed rather than exposed as a
@@ -1040,7 +1040,7 @@ function nextTransitionInfo(now, lat, lng) {
 
   const h = Math.floor(soonest / 3600);
   const m = Math.floor((soonest % 3600) / 60);
-  return best.file.replace(/^t_to_|\.mp4$/g, "") +
+  return best.file.replace(/^T_To_|\.mp4$/g, "") +
          " in " + (h ? h + "h " : "") + m + "m";
 }
 
